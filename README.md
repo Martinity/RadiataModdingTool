@@ -24,12 +24,12 @@ Compressor has four mode. Advanced specs can be found near the top of RadiataCom
 -3 LZSS16: LZSS with 16bit flags and 2byte literals.
 
 
-Compressor generates a similar offset histogram to the original. In my testing this compressor compresses files slightly more than the original.
+Compressor generates a similar offset histogram to the original. In my testing this compressor compresses files slightly more than the original. Uses a greedy search algorithm.
 
 Decompression/Encryption generates bit identical outputs compared to original.
 
-### Areas of Improvments
-Speed of compression. 
+### Notable areas of improvement
+Speed of compression, currently $O(n)^2$
 
 I have not researched runtime decompression speeds.
 
