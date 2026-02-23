@@ -126,7 +126,18 @@ def launch_gui():
     ttk.Label(top_content, text="Output Options:", font=("Courier New", 10, "bold"), background="#C0C0C0").pack(anchor="w", padx=12, pady=(12, 5))
 
     chain_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(top_content, text="Chained archive", variable=chain_var,
+    bank_var = tk.BooleanVar(value=False)
+
+    def on_chain_toggle():
+        if chain_var.get(): bank_var.set(False)
+        output_path_var.set("")
+    def on_bank_toggle():
+        if bank_var.get(): chain_var.set(False)
+        output_path_var.set("")
+
+    tk.Checkbutton(top_content, text="Chained archive", variable=chain_var, command=on_chain_toggle,
+                   bg="#C0C0C0", font=("Courier New", 10)).pack(anchor="w", padx=20, pady=3)
+    tk.Checkbutton(top_content, text="Bank archive (sector-aligned)", variable=bank_var, command=on_bank_toggle,
                    bg="#C0C0C0", font=("Courier New", 10)).pack(anchor="w", padx=20, pady=3)
 
     sle_var = tk.BooleanVar(value=False)
@@ -141,10 +152,10 @@ def launch_gui():
     tk.Entry(output_frame, textvariable=output_path_var, font=("Courier New", 10), width=65, relief="sunken", bd=3).pack(side="left", padx=8, fill="x", expand=True)
 
     def browse_output():
-        if chain_var.get():
+        if chain_var.get() or bank_var.get():
             ext = ".sle" if sle_var.get() else ".slz"
-            f = filedialog.asksaveasfilename(title="Save Chained Archive", defaultextension=ext,
-                                             filetypes=[("SLZ/SLE Archive", "*.slz *.sle"), ("All Files", "*.*")])
+            label = "Save Bank Archive" if bank_var.get() else "Save Chained Archive"
+            f = filedialog.asksaveasfilename(title=label, defaultextension=ext)
             if f: output_path_var.set(f)
         else:
             d = filedialog.askdirectory(title="Select Output Folder")
@@ -163,6 +174,8 @@ def launch_gui():
     progress_bar.pack(fill="x", padx=12, pady=4)
 
     # ====================== RUN COMPRESSION ======================
+    _comp_progress = {"percent": 0, "msg": "", "done": False, "error": None, "log": []}
+
     def run_compression():
         files = list(input_listbox.get(0, "end"))
         if not files:
@@ -182,8 +195,9 @@ def launch_gui():
 
         modes = [mode] * len(files)
         chain = chain_var.get()
+        bank = bank_var.get()
 
-        if chain:
+        if chain or bank:
             output_paths = [out_path]
         else:
             ext = ".sle" if sle_var.get() else ".slz"
@@ -191,39 +205,58 @@ def launch_gui():
 
         progress_bar.configure(value=0)
         current_status.set("Starting compression...")
+        compress_btn.configure(state="disabled")
 
-        log_lines = []
+        _comp_progress["percent"] = 0
+        _comp_progress["msg"] = "Starting compression..."
+        _comp_progress["done"] = False
+        _comp_progress["error"] = None
+        _comp_progress["log"] = []
 
         def gui_log(text):
-            log_lines.append(text)
+            _comp_progress["log"].append(text)
             print(text)
 
         def gui_progress(percent, msg):
-            root.after(0, lambda: progress_bar.configure(value=percent))
-            root.after(0, lambda: current_status.set(msg[:85]))
+            _comp_progress["percent"] = percent
+            _comp_progress["msg"] = msg[:85]
 
         def thread_target():
             try:
-                start_compression(files, modes, output_paths, chain,
+                start_compression(files, modes, output_paths, chain, bank=bank,
                                   log_func=gui_log, progress_callback=gui_progress)
-                full_log = "\n".join(log_lines)
-                root.after(0, lambda: show_completion_dialog("COMPRESSION COMPLETE", full_log))
-                root.after(0, lambda: current_status.set("✓ All done!"))
+                _comp_progress["percent"] = 100
+                _comp_progress["msg"] = "All done!"
+                _comp_progress["done"] = True
             except Exception as e:
-                err = str(e)
-                root.after(0, lambda: messagebox.showerror("Error", err))
-                root.after(0, lambda: current_status.set("ERROR: " + err[:60]))
+                _comp_progress["error"] = str(e)
+                _comp_progress["done"] = True
+
+        def poll_progress():
+            progress_bar.configure(value=_comp_progress["percent"])
+            current_status.set(_comp_progress["msg"])
+            if _comp_progress["done"]:
+                compress_btn.configure(state="normal")
+                if _comp_progress["error"]:
+                    current_status.set("ERROR: " + _comp_progress["error"][:60])
+                    messagebox.showerror("Error", _comp_progress["error"])
+                else:
+                    full_log = "\n".join(_comp_progress["log"])
+                    show_completion_dialog("COMPRESSION COMPLETE", full_log)
+            else:
+                root.after(100, poll_progress)
 
         threading.Thread(target=thread_target, daemon=True).start()
-        messagebox.showinfo("Running", "Compression started!\nWatch the progress bar.")
+        root.after(100, poll_progress)
 
     # Big button always at bottom
     button_frame = tk.Frame(compress_tab, bg="#C0C0C0")
     button_frame.pack(side="bottom", fill="x", padx=12, pady=12)
 
-    tk.Button(button_frame, text="START COMPRESSION", command=run_compression,
+    compress_btn = tk.Button(button_frame, text="START COMPRESSION", command=run_compression,
               relief="raised", bd=5, bg="#C0C0C0", activebackground="#000080",
-              font=("Courier New", 12, "bold"), height=2).pack(fill="x")
+              font=("Courier New", 12, "bold"), height=2)
+    compress_btn.pack(fill="x")
         
     # ====================== DECOMPRESS TAB ======================
     decompress_tab = ttk.Frame(notebook)
@@ -263,7 +296,18 @@ def launch_gui():
     tk.Button(decomp_out_frame, text="Browse Folder", command=lambda: decomp_out_var.set(filedialog.askdirectory() or decomp_out_var.get()),
               relief="raised", bd=3, bg="#C0C0C0", font=("Courier New", 10)).pack(side="left")
 
+    # Live Progress
+    ttk.Label(decompress_tab, text="Live Progress:", font=("Courier New", 10, "bold"), background="#C0C0C0").pack(anchor="w", padx=12, pady=(8,2))
+    decomp_status = tk.StringVar(value="Idle - Ready to decompress")
+    tk.Label(decompress_tab, textvariable=decomp_status, font=("Courier New", 10), bg="#C0C0C0", fg="#006400",
+             relief="sunken", bd=2, anchor="w", padx=8).pack(fill="x", padx=12, pady=2)
+
+    decomp_progress = ttk.Progressbar(decompress_tab, length=720, mode='determinate')
+    decomp_progress.pack(fill="x", padx=12, pady=4)
+
     # ──────── DECOMPRESSION RUN FUNCTION ────────
+    _decomp_progress = {"percent": 0, "msg": "", "done": False, "error": None, "log": []}
+
     def run_decompression():
         files = list(decomp_listbox.get(0, "end"))
         if not files:
@@ -274,19 +318,57 @@ def launch_gui():
             messagebox.showerror("Error", "Select an output directory")
             return
 
+        decomp_progress.configure(value=0)
+        decomp_status.set("Starting decompression...")
+        decomp_btn.configure(state="disabled")
+
+        _decomp_progress["percent"] = 0
+        _decomp_progress["msg"] = "Starting decompression..."
+        _decomp_progress["done"] = False
+        _decomp_progress["error"] = None
+        _decomp_progress["log"] = []
+
+        def gui_log(text):
+            _decomp_progress["log"].append(text)
+            print(text)
+
+        def gui_progress(percent, msg):
+            _decomp_progress["percent"] = percent
+            _decomp_progress["msg"] = msg[:85]
+
         def thread_target():
             try:
-                start_decompression(files, out_dir)
-                root.after(0, lambda: messagebox.showinfo("Success",
-                    f"Decompression finished!\n\nFiles saved to:\n{out_dir}"))
+                start_decompression(files, out_dir, log_func=gui_log, progress_callback=gui_progress)
+                _decomp_progress["percent"] = 100
+                _decomp_progress["msg"] = "All done!"
+                _decomp_progress["done"] = True
             except Exception as e:
-                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                _decomp_progress["error"] = str(e)
+                _decomp_progress["done"] = True
+
+        def poll_progress():
+            decomp_progress.configure(value=_decomp_progress["percent"])
+            decomp_status.set(_decomp_progress["msg"])
+            if _decomp_progress["done"]:
+                decomp_btn.configure(state="normal")
+                if _decomp_progress["error"]:
+                    decomp_status.set("ERROR: " + _decomp_progress["error"][:60])
+                    messagebox.showerror("Error", _decomp_progress["error"])
+                else:
+                    full_log = "\n".join(_decomp_progress["log"])
+                    show_completion_dialog("DECOMPRESSION COMPLETE", full_log)
+            else:
+                root.after(100, poll_progress)
 
         threading.Thread(target=thread_target, daemon=True).start()
-        messagebox.showinfo("Running", "Decompression started in background.\nWatch the terminal for details.")
+        root.after(100, poll_progress)
 
-    tk.Button(decompress_tab, text="START DECOMPRESSION", command=run_decompression, relief="raised", bd=5,
-              bg="#C0C0C0", activebackground="#00FF00", font=("Courier New", 12, "bold"), height=2).pack(pady=25)
+    decomp_btn_frame = tk.Frame(decompress_tab, bg="#C0C0C0")
+    decomp_btn_frame.pack(side="bottom", fill="x", padx=12, pady=12)
+
+    decomp_btn = tk.Button(decomp_btn_frame, text="START DECOMPRESSION", command=run_decompression, relief="raised", bd=5,
+              bg="#C0C0C0", activebackground="#00FF00", font=("Courier New", 12, "bold"), height=2)
+    decomp_btn.pack(fill="x")
 
     root.mainloop()
 

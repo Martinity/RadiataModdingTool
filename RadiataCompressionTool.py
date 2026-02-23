@@ -61,7 +61,59 @@ MODE_DISPLAY = {
 
 ###------------------------------ COMPRESS ----------------------------------###
 
-def start_compression(data_path: list[str], modes: list[int], output_path: list|str, chain: bool, log_func=None, progress_callback=None) -> None:
+HASH_BITS = 15
+HASH_SIZE = 1 << HASH_BITS
+
+def _hash3(data, pos):
+    return ((data[pos] << 10) ^ (data[pos+1] << 5) ^ data[pos+2]) & (HASH_SIZE - 1)
+
+def _find_best_match(data, pos, n, params, head, prev):
+    max_length = min(params['max_match'], n - pos)
+    if max_length < params['min_match']:
+        return 0, 0
+    word_aligned = params.get('word_aligned', False)
+    step = 2 if word_aligned else 1
+    max_offset = params['window_size'] - step
+    h = _hash3(data, pos)
+    candidate = head[h]
+    best_length = 0
+    best_offset = 0
+    chain_limit = 64
+    first_byte = data[pos]
+    while candidate >= 0 and chain_limit > 0:
+        offset = pos - candidate
+        if offset > max_offset:
+            break
+        if offset < step:
+            candidate = prev[candidate % params['window_size']]
+            chain_limit -= 1
+            continue
+        if word_aligned and offset % 2 != 0:
+            candidate = prev[candidate % params['window_size']]
+            chain_limit -= 1
+            continue
+        if data[candidate] == first_byte:
+            ml = 0
+            while ml < max_length and data[candidate + ml] == data[pos + ml]:
+                ml += 1
+            if word_aligned:
+                ml -= ml % 2
+            if ml > best_length:
+                best_length = ml
+                best_offset = offset
+                if best_length == max_length:
+                    break
+        candidate = prev[candidate % params['window_size']]
+        chain_limit -= 1
+    return best_length, best_offset
+
+def _update_hash(data, pos, n, params, head, prev):
+    if pos + 2 < n:
+        h = _hash3(data, pos)
+        prev[pos % params['window_size']] = head[h]
+        head[h] = pos
+
+def start_compression(data_path: list[str], modes: list[int], output_path: list|str, chain: bool, bank: bool = False, log_func=None, progress_callback=None) -> None:
     def log(msg):
         if log_func:
             log_func(msg)
@@ -82,7 +134,7 @@ def start_compression(data_path: list[str], modes: list[int], output_path: list|
 
         compressed = lzss_compress(raw_data, mode, filename=filepath, progress_callback=progress_callback)
         
-        target_ext = output_path[0].lower() if chain else output_path[i].lower()
+        target_ext = output_path[0].lower() if (chain or bank) else output_path[i].lower()
         if target_ext.endswith('.sle'):
             compressed = scramble_slz_payload(compressed)
             
@@ -98,9 +150,18 @@ def start_compression(data_path: list[str], modes: list[int], output_path: list|
         })
         compressed_blobs.append(compressed)
         if progress_callback:
-            progress_callback(100, f"✓ {filename} done → {comp_size:,} bytes ({ratio:.1f}%)")
+            progress_callback(100, f"{filename} done - {comp_size:,} bytes ({ratio:.1f}%)")
 
-    if chain:  # Chained ouput
+    if bank:  # Bank output: sector-aligned independent blocks
+        container = bytearray()
+        for blob in compressed_blobs:
+            container.extend(blob)
+            padding = (0x800 - (len(container) % 0x800)) % 0x800
+            container.extend(b'\x00' * padding)
+        with open(output_path[0], 'wb') as f:
+            f.write(container)
+        total_comp_size = len(container)
+    elif chain:  # Chained ouput
         container = bytearray()
         file_starts = []
         for blob in compressed_blobs:
@@ -152,8 +213,16 @@ def lzss_compress(data: bytes, mode: int, filename: str = "", progress_callback=
         data += b'\x00'
         n += 1
 
+    head = [-1] * HASH_SIZE
+    prev = [-1] * params['window_size']
+
+    last_percent = -1
     def show_progress(current, total):
+        nonlocal last_percent
         percent = int((current / total) * 100)
+        if percent == last_percent:
+            return
+        last_percent = percent
         bar_width = 40
         filled = int(bar_width * current / total)
         bar = '█' * filled + '─' * (bar_width - filled)
@@ -193,51 +262,27 @@ def lzss_compress(data: bytes, mode: int, filename: str = "", progress_callback=
                 if run_length <= params['rle_short_max']: # RLE short
                     token_buffer.extend([fill, 0xF0 | (run_length - params['length_base'])])
                 else: # RLE long
-                    token_buffer.extend([(run_length - params['rle_long_min']), 0xF0, fill])                
-                i += run_length 
+                    token_buffer.extend([(run_length - params['rle_long_min']), 0xF0, fill])
+                for k in range(run_length):
+                    _update_hash(data, i + k, n, params, head, prev)
+                i += run_length
 
         if not RLE_triggered : # LZSS
-            best_length = 0
-            best_offset = 0
+            best_length, best_offset = _find_best_match(data, i, n, params, head, prev)
 
-            max_length = min(params['max_match'], n - i)
-            if max_length >= params['min_match']: # start search
-                start_offset = 2 if params['word_aligned'] else 1
-                step = 2 if params['word_aligned'] else 1
-                max_offset = params['window_size'] - step
-                max_search = min(i, max_offset)
-                for offset in range(start_offset, max_search + 1, step):
-                    candidate = i - offset
-
-                    if data[candidate] != data[i]:
-                        continue
-                    
-                    match_length = 0
-                    while (match_length < max_length and i + match_length < n and
-                        data[candidate + match_length] == data[i + match_length]):
-                        match_length += 1
-
-                    if params['word_aligned']:
-                        match_length -= match_length % 2
-
-                    if match_length > best_length:
-                        best_length = match_length
-                        best_offset = offset
-                        if best_length == max_length:
-                            break
-            
             if best_length >= params['min_match']:  # LZSS match
                 flag_bits |= (0 << flag_count)
                 flag_count += 1
                 token_buffer.extend(_encode_match(best_offset, best_length, params))
-                # Advance by the matched length
+                for k in range(best_length):
+                    _update_hash(data, i + k, n, params, head, prev)
                 i += best_length
 
             else: # Literal
                 flag_bits |= (1 << flag_count)
                 flag_count += 1
                 token_buffer.extend((data[i : i + params['literal_size']]))
-
+                _update_hash(data, i, n, params, head, prev)
                 i += params['literal_size']
         show_progress(i, n)
     # Flush remaining literals
@@ -294,7 +339,7 @@ def scramble_slz_payload(data: bytes) -> bytes:
 
 ###----------------------------- DECOMPRESS --------------------------------###
 
-def start_decompression(data_path: list, output_path: str, log_func=None) -> None:
+def start_decompression(data_path: list, output_path: str, log_func=None, progress_callback=None) -> None:
     def log(msg):
         if log_func:
             log_func(msg)
@@ -304,7 +349,8 @@ def start_decompression(data_path: list, output_path: str, log_func=None) -> Non
     if not os.path.isdir(output_path):
         os.makedirs(output_path, exist_ok=True)
 
-    for path in data_path:
+    total_files = len(data_path)
+    for file_idx, path in enumerate(data_path):
         log(f"\n=== Decompressing {os.path.basename(path)} ===")
         file = load_file(path)
         if file[:3] not in [b'SLZ', b'SLE']: # verify file type
@@ -325,20 +371,56 @@ def start_decompression(data_path: list, output_path: str, log_func=None) -> Non
                     raise ValueError("Invalid chain pointer")
                 chains.append(next_idx)
                 index = next_idx
+        elif len(chains) == 1:
+            # Bank-style: independent blocks at sector-aligned boundaries (next_offset=0)
+            comp_len = int.from_bytes(file[4:8], 'little')
+            next_pos = (16 + comp_len + 0x7FF) & ~0x7FF
+            if next_pos + 16 < len(file) and file[next_pos:next_pos+3] in [b'SLZ', b'SLE']:
+                chains = []
+                pos = 0
+                while pos + 16 < len(file):
+                    if file[pos:pos+3] not in [b'SLZ', b'SLE']:
+                        break
+                    cl = int.from_bytes(file[pos+4:pos+8], 'little')
+                    if cl == 0:
+                        break
+                    chains.append(pos)
+                    pos = (pos + 16 + cl + 0x7FF) & ~0x7FF
 
         decompressed_files = []
-        for start in chains:
+        stats = []
+        total_chunks = len(chains)
+        for chunk_idx, start in enumerate(chains):
             compressed_len = int.from_bytes(file[start+4:start+8], 'little')
             segment_end = start + 16 + compressed_len
             if segment_end > len(file):
                 raise ValueError(f"Segment at 0x{start:x} overruns file")
             segment = file[start:segment_end]
-            if segment[:3] == b'SLE': # convert SLE to SLZ
+            if segment[:3] == b'SLE':
                 segment = unscramble_slz_payload(segment)
-            log(f'Index:[{hex(start)}:{hex(segment_end)}], Length:{hex(compressed_len)}, Mode:{segment[3]}, Sectors:{len(file)/0x1200:.2f}')
+            mode = segment[3]
             dec = lzss_decompress(segment, compressed_len)
             decompressed_files.append(dec)
-    
+            stats.append({'mode': mode, 'compressed': compressed_len, 'decompressed': len(dec)})
+            if progress_callback:
+                pct = int(((file_idx + (chunk_idx + 1) / total_chunks) / total_files) * 100)
+                progress_callback(pct, f"{os.path.basename(path)} chunk {chunk_idx+1}/{total_chunks}")
+
+        total_comp = sum(s['compressed'] for s in stats)
+        total_decomp = sum(s['decompressed'] for s in stats)
+        table = "\n" + "=" * 75 + "\n"
+        table += f"{'Chunk':<8} | {'Mode':<12} | {'Compressed':>12} | {'Decompressed':>14} | {'Ratio':>8}\n"
+        table += "-" * 75 + "\n"
+        for i, s in enumerate(stats, 1):
+            mode_name = COMPRESSION_MODES[s['mode']]['name'] if s['mode'] in COMPRESSION_MODES else f"Unknown({s['mode']})"
+            ratio = (s['compressed'] / s['decompressed'] * 100) if s['decompressed'] > 0 else 0
+            table += f"{i:<8} | {mode_name:<12} | {s['compressed']:>12,} | {s['decompressed']:>14,} | {ratio:>6.2f}%\n"
+        table += "-" * 75 + "\n"
+        total_ratio = (total_comp / total_decomp * 100) if total_decomp > 0 else 0
+        table += f"{'TOTAL':<8} | {'-':<12} | {total_comp:>12,} | {total_decomp:>14,} | {total_ratio:>6.2f}%\n"
+        table += "=" * 75 + "\n"
+        log(table)
+
         base = Path(path).stem
         save_base = os.path.join(output_path, base)
         ext = '.raw'
@@ -496,6 +578,8 @@ if __name__ == "__main__":
     comp.add_argument('output', metavar='OUTPUT', help='Directory for output. Include file name if using --chain')
     comp.add_argument('-m', '--mode', type=int, choices=[0,1,2,3], default=3, help='0=Store, 1=LZSS, 2=LZSS/RLE, 3=LZSS16')
     comp.add_argument('--chain', action='store_true', help='For mulitple input files chained into one output file')
+    comp.add_argument('--bank', action='store_true', help='For multiple input files as sector-aligned independent blocks')
+    comp.add_argument('--modes', type=str, default=None, help='Comma-separated modes per input (e.g. 2,1,0). Requires --chain or --bank')
     comp.add_argument('--sle', action='store_true', help='Compress and encrypt')
 
     decomp = subparsers.add_parser('decompress')
@@ -505,12 +589,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # arg parsing execution
     if args.command == 'compress':
-        if not args.chain and len(args.inputs) != 1:
-            parser.error('Compression only supports 1 input file at a time. Use --chain for chained archives.')
-    
-        modes = [args.mode] * len(args.inputs)
+        if args.chain and args.bank:
+            parser.error('--chain and --bank are mutually exclusive')
+        if not (args.chain or args.bank) and len(args.inputs) != 1:
+            parser.error('Compression only supports 1 input file at a time. Use --chain or --bank for multi-file archives.')
+
+        if args.modes:
+            if not (args.chain or args.bank):
+                parser.error('--modes requires --chain or --bank')
+            modes = [int(m) for m in args.modes.split(',')]
+            if len(modes) != len(args.inputs):
+                parser.error(f'--modes has {len(modes)} values but {len(args.inputs)} inputs given')
+            for m in modes:
+                if m not in COMPRESSION_MODES:
+                    parser.error(f'Invalid mode {m} in --modes')
+        else:
+            modes = [args.mode] * len(args.inputs)
         
-        if args.chain:
+        if args.chain or args.bank:
             output_paths = [args.output]
         else:
             ext = ".sle" if args.sle else ".slz"
@@ -521,7 +617,7 @@ if __name__ == "__main__":
             output_paths = [str(out)]
         
         print(f'Starting compression mode:{args.mode}')
-        start_compression(args.inputs, modes, output_paths, args.chain)
+        start_compression(args.inputs, modes, output_paths, args.chain, args.bank)
     elif args.command == 'decompress':
         print('Starting decompression')
         start_decompression(args.inputs, args.output)
