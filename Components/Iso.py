@@ -62,7 +62,7 @@ def get_extension(sector_data:bytes, sector_index:int) -> str:
     return ".bin" # unknown header
 
 
-def unpack_iso(iso_path: Path, out_dir: Path):
+def unpack_iso(iso_path: Path, out_dir: Path, progress_callback=None):
     params = ISO_PARAMS
     out_dir.mkdir(exist_ok=True, parents=True)
 
@@ -100,8 +100,9 @@ def unpack_iso(iso_path: Path, out_dir: Path):
                     for _ in range(size-1):
                         f.write(iso.read(params['sector']))
 
-                if sector_index<10:
-                    logger.info(f"Extracted {out_file} ({size} sectors:LBA {hex(lba)})")
+                if progress_callback and sector_index % 100 == 0:
+                    progress_callback(sector_index, total_entries)
+
             except Exception as e:
                 logger.error(f'Error extracting index {sector_index} at LBA {hex(lba)}: {e}')
 
