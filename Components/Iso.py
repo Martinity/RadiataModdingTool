@@ -30,7 +30,7 @@ HEADERS = {
     }
 ###------------------------- Unpacking -----------------------------###
 
-def unscramble_toc(scrambled_toc:bytes, seed:int, total_entries:int) -> list:
+def _unscramble_toc(scrambled_toc:bytes, seed:int, total_entries:int) -> list:
     toc = list(struct.unpack("<%dI" % (total_entries * 3), scrambled_toc))
     key = seed
  
@@ -47,7 +47,7 @@ def unscramble_toc(scrambled_toc:bytes, seed:int, total_entries:int) -> list:
     return toc
 
 
-def get_extension(sector_data:bytes, sector_index:int) -> str:
+def _get_extension(sector_data:bytes, sector_index:int) -> str:
     header_magic = int.from_bytes(sector_data[:3], 'little')
     if header_magic in HEADERS: # header is static
         return HEADERS[header_magic]
@@ -62,28 +62,28 @@ def get_extension(sector_data:bytes, sector_index:int) -> str:
     return ".bin" # unknown header
 
 
-def unpack_iso(iso_path: Path, out_dir: Path, progress_callback=None):
+def unpack_iso(iso_path: Path, out_dir: Path, progress_callback=None) -> None:
     params = ISO_PARAMS
     out_dir.mkdir(exist_ok=True, parents=True)
 
     with open(iso_path, "rb") as iso: 
         iso.seek(params["toc_offset"])
         signature = struct.unpack("<I", iso.read(4))[0]
-        if signature != params["signature"]:
+        if signature != params["signature"]: # Verify ISO
             raise RuntimeError("Not a Radiata Stories ISO")
         logger.info("Found Radiata Stories ISO")
-
+        # Unscramble TOC
         total_entries = params["total_entries"]
         iso.seek(params["toc_offset"])
         scrambled_toc = iso.read(total_entries * 3 * 4)
         if len(scrambled_toc) < total_entries * 3 * 4:
             raise ValueError('ISO is too small; toc data invalid')
         
-        toc = unscramble_toc(scrambled_toc, params["seed"], total_entries)
+        toc = _unscramble_toc(scrambled_toc, params["seed"], total_entries)
         logger.info(f'Unscrambled toc with {total_entries} entries.')
         toc[0] = params["toc_offset"] // params["sector"]
 
-        for sector_index in range(total_entries):
+        for sector_index in range(total_entries): # Extract one file at a time
             try:
                 lba  = toc[sector_index]
                 size = toc[total_entries + sector_index]
@@ -92,8 +92,8 @@ def unpack_iso(iso_path: Path, out_dir: Path, progress_callback=None):
 
                 iso.seek(lba * params['sector'])
                 first_sector = iso.read(params['sector'])
-                ext = get_extension(first_sector, sector_index)
-
+                ext = _get_extension(first_sector, sector_index)
+                # Build appropriate file name
                 out_file = out_dir.joinpath(f"{sector_index:04d}{ext}")
                 with open(out_file, 'wb') as f:
                     f.write(first_sector)
