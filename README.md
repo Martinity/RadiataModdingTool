@@ -11,7 +11,7 @@ GUI for user-friendly (ai generated), CLI for speed
 `python gui.py`
 or windows executable from release
 #### CLI:
-`python cli.py -h` for mor information
+`python cli.py -h` for more information
 
 ## Compressor
 Achieves compression/decompression through header parsing, meaning files that have embedded or nonchained compressed files will need to be split to their own file before this tool can parse them.
