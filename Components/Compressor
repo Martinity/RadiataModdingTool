@@ -2,7 +2,7 @@
 from typing import Dict, Any
 import os
 from pathlib import Path
-import argparse
+from Components.Iso import HEADERS
 
 COMPRESSION_MODES: Dict[int, Dict[str, Any]] = {
     0: {  # STORE / uncompressed
@@ -434,8 +434,7 @@ def start_decompression(data_path: list, output_path: str, log_func=None, progre
 
         base = Path(path).stem
         save_base = os.path.join(output_path, base)
-        ext = '.raw'
-        save_files(decompressed_files, save_base, ext, log_func = log_func)
+        save_files(decompressed_files, save_base, log_func = log_func)
 
 
 
@@ -566,8 +565,15 @@ def load_file(filename: str, min_size = 0x10, max_size = 0x1000000) -> bytes:
         raise
 
 
-def save_files(files: list, basename: str, ext:str, log_func=None) -> None:
+def save_files(files: list, basename: str, log_func=None) -> None:
+    print('here')
     for i, item in enumerate(files, start=1):
+        ext = '.bin'
+        for magic, suffix in sorted(HEADERS.items(), key=lambda x: -len(x[0])):
+            if item.startswith(magic): # scan matching header largest to smallest
+                ext = suffix
+                break
+
         if len(files)>1:
             outname = f'{basename}{ext}{i}'
         else:
@@ -579,61 +585,3 @@ def save_files(files: list, basename: str, ext:str, log_func=None) -> None:
         log_func(msg)
     else:
         print(msg)
-
-###------------------------- MAIN -----------------------------###
-
-if __name__ == "__main__":
-    # arg parsing setup
-    parser = argparse.ArgumentParser(description='Radiata Stories slz/sle Tool - CLI')
-    subparsers = parser.add_subparsers(dest='command', required=True)
-    
-    comp = subparsers.add_parser('compress')
-    comp.add_argument('inputs', nargs='+', metavar='INPUT', help='Input file(s)')
-    comp.add_argument('output', metavar='OUTPUT', help='Directory for output. Include file name if using --chain')
-    comp.add_argument('-m', '--mode', type=int, choices=[0,1,2,3], default=3, help='0=Store, 1=LZSS, 2=LZSS/RLE, 3=LZSS16')
-    comp.add_argument('--chain', action='store_true', help='For mulitple input files chained into one output file')
-    comp.add_argument('--bank', action='store_true', help='For multiple input files as sector-aligned independent blocks')
-    comp.add_argument('--modes', type=str, default=None, help='Comma-separated modes per input (e.g. 2,1,0). Requires --chain or --bank')
-    comp.add_argument('--sle', action='store_true', help='Compress and encrypt')
-
-    decomp = subparsers.add_parser('decompress')
-    decomp.add_argument('inputs', nargs='+', metavar='INPUT', help='Input file')
-    decomp.add_argument('output', metavar='OUTPUT', help='Directory for output')
-
-    args = parser.parse_args()
-    # arg parsing execution
-    if args.command == 'compress':
-        if args.chain and args.bank:
-            parser.error('--chain and --bank are mutually exclusive')
-        if not (args.chain or args.bank) and len(args.inputs) != 1:
-            parser.error('Compression only supports 1 input file at a time. Use --chain or --bank for multi-file archives.')
-
-        if args.modes:
-            if not (args.chain or args.bank):
-                parser.error('--modes requires --chain or --bank')
-            modes = [int(m) for m in args.modes.split(',')]
-            if len(modes) != len(args.inputs):
-                parser.error(f'--modes has {len(modes)} values but {len(args.inputs)} inputs given')
-            for m in modes:
-                if m not in COMPRESSION_MODES:
-                    parser.error(f'Invalid mode {m} in --modes')
-        else:
-            modes = [args.mode] * len(args.inputs)
-        
-        if args.chain or args.bank:
-            output_paths = [args.output]
-        else:
-            ext = ".sle" if args.sle else ".slz"
-            out = Path(args.output)
-
-            if not out.suffix:
-                out = out / (Path(args.inputs[0]).stem + ext)
-            output_paths = [str(out)]
-        
-        print(f'Starting compression mode:{args.mode}')
-        start_compression(args.inputs, modes, output_paths, args.chain, args.bank)
-    elif args.command == 'decompress':
-        print('Starting decompression')
-        start_decompression(args.inputs, args.output)
-
-    print('\nDone')
