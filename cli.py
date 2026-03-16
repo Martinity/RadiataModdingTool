@@ -92,15 +92,24 @@ if __name__ == "__main__":
         print('Starting decompression')
         start_decompression(args.inputs, args.output)
 
-    elif args.command == 'kods': # Kods
-        if args.kods_command == 'pack':
+    elif args.command == 'kods':
+        if args.kods_command == 'pack': # Pack Kods
             print('Starting Kods packing')
             start_kods_packing(Path(args.input), Path(args.output), Path(args.original))
-        elif args.kods_command == 'extract':
-            print('Starting Kods extraction')
-            start_kods_unpacking(Path(args.input), Path(args.output))
 
-    elif args.command == 'iso': # ISO
+        elif args.kods_command == 'extract': # Extract Kods
+            print('Starting Kods extraction')
+            stats = start_kods_unpacking(Path(args.input), Path(args.output))
+
+            print(f"\nCompleted — {stats['extracted']} unique files extracted")
+            if stats.get("aliases_skipped"):
+                print(f"   {stats['aliases_skipped']} aliases skipped (duplicates)")
+            if stats.get("tail"):
+                print(f"   Tail extracted → {stats['tail']}")
+            if stats.get("runtime_warning"):
+                print(f"   {stats['runtime_warning']}")
+
+    elif args.command == 'iso': # Extract Iso
         if args.iso_command == 'extract':
             unpack_iso(Path(args.input), Path(args.output))
 
