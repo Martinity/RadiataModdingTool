@@ -1,9 +1,10 @@
 # RadiataModdingTool
 ## Overview
 A modding tool for radiata stories that can:
-- Extract ISO contents
+- Pack/Extract ISO contents
 - Compress/Decompress SLZ/SLE files
 - Pack/Extract Kods archives
+- Disk wide file names
   
 ## Usage
 GUI for user-friendly (ai generated), CLI for speed
@@ -34,5 +35,6 @@ Achieves packing/extracting through parsing the original kods. You will need to 
 - Chained files forced to 1 mode could change if needed, but all original chained archives have a single mode that can recompress all files to the same sector size.
 
 ### Thanks to;
+- r-casanova R for the many helpful commits
 - yu.na. for help with the kods archive format
 - CUE for the ISO TOC handling
