@@ -17,6 +17,7 @@ def start_kods_packing(input_dir: Path, output_path: Path, original_kods: Path) 
         raw_original = f.read()
     if not raw_original[:4] == b'Kods':
         raise ValueError('Original file is missing kods header')
+    original_name = original_kods.name
     # Determine original parameters
     params = _parse_header(raw_original)
     original_length = len(raw_original)
@@ -39,7 +40,7 @@ def start_kods_packing(input_dir: Path, output_path: Path, original_kods: Path) 
     kods_header = _create_kods_header(best_params)
     offsets, final_blocks = _calculate_offsets(data_blocks, best_params, aliases, last_is_sentinel)
     # The packing and reporting
-    packed_length = _pack_kods(output_path, kods_header, best_params, final_blocks, offsets, extended_raw, raw_tail, original_length)
+    packed_length = _pack_kods(output_path, kods_header, best_params, final_blocks, offsets, extended_raw, raw_tail, original_name, original_length)
     _report_sectors(original_length, packed_length)
     print('Final Parameters:',best_params)
 
@@ -185,8 +186,8 @@ def _calculate_offsets(data_blocks: list[Optional[bytes]], params: dict,
     return shifted_offsets, final_data_blobs
 
 
-def _pack_kods(output_path: Path, kods_header: int, params: dict, data_blocks: list[bytes], offsets: list[int], extended_raw: Optional[bytes], raw_tail: Optional[bytes], original_length: int = 0) -> int:
-    out_file = output_path / 'repack.bin'
+def _pack_kods(output_path: Path, kods_header: int, params: dict, data_blocks: list[bytes], offsets: list[int], extended_raw: Optional[bytes], raw_tail: Optional[bytes], original_name: str, original_length: int = 0) -> int:
+    out_file = output_path / original_name
     with open(out_file, 'wb') as f:
         f.write(b'Kods') # write header
         f.write(struct.pack('<I', kods_header))
