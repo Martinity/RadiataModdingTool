@@ -579,9 +579,9 @@ def launch_gui():
                   bg="#C0C0C0", font=("Courier New", 10)).pack(side="left")
         return var
 
-    orig_kods_var = create_path_row(kods_pack_tab, "1. Original .kods File (Header Template):", is_dir=False, filetypes=[("KODS", "*.kods"), ("All", "*.*")])
-    input_dir_var = create_path_row(kods_pack_tab, "2. Input Directory (Folder with .bin files):", is_dir=True)
-    output_dir_var = create_path_row(kods_pack_tab, "3. Output Directory (Where to save repack.bin):", is_dir=True)
+    orig_kods_var = create_path_row(kods_pack_tab, "1. Original .kods File:", is_dir=False, filetypes=[("KODS", "*.kods"), ("All", "*.*")])
+    input_dir_var = create_path_row(kods_pack_tab, "2. Input Directory:", is_dir=True)
+    output_dir_var = create_path_row(kods_pack_tab, "3. Output Directory:", is_dir=True)
 
     ttk.Label(kods_pack_tab, text="Live Progress:", font=("Courier New", 10, "bold"), background="#C0C0C0").pack(anchor="w", padx=12, pady=(20,2))
     kods_p_status = tk.StringVar(value="Idle - Ready to build .kods archive")
