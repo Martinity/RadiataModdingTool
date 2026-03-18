@@ -321,7 +321,7 @@ def extract_kods(raw_kods: bytes, output_path: Path, kods_name: str, params: dic
         # Bug 3 fix: write zero-length file for valid zero-length entries
         if start >= end:
             ext = '.bin'
-            out_name = f'{kods_name}_{i:04X}{ext}'
+            out_name = f'{kods_name}_{i:04d}{ext}'
             (output_path / out_name).write_bytes(b'')
             extracted += 1
             continue
@@ -340,7 +340,7 @@ def extract_kods(raw_kods: bytes, output_path: Path, kods_name: str, params: dic
                 if segment.startswith(magic): # scan matching header largest to smallest
                     ext = suffix
                     break
-            out_name = f'{kods_name}_{i:04X}{ext}'
+            out_name = f'{kods_name}_{i:04d}{ext}'
             (output_path / out_name).write_bytes(segment)
             seen[(start, end)] = i
             extracted += 1
