@@ -1,5 +1,7 @@
 # Radiata Modding Tool: Plugin Developer API
 
+__Temporarily out of date in terms of API, still valid for understanding registration. In the mean time check the latest handlers/editors if you are implementing a new plugin.__
+
 This document covers everything needed to implement a **handler** (binary
 format interpreter) or **editor** (UI widget), and how they interact through
 the session and dispatcher pipeline. In general payloads of type `bytes` are handled automatically by the contracts, for more complex plugins you will need to override to the desired type.
@@ -66,7 +68,7 @@ User clicks Save
                                       (Repacks payload back to raw binary)
                                                │
    ┌── success / fail signal ──────────────────┘
-   ▼ 
+   ▼
 session.confirm_save() (on success)
 session.reject_save()  (on failure)
 ```
@@ -162,7 +164,7 @@ Repack modified children into the container. For each child use
 `child.pending_data` if staged, otherwise `get_raw_node(child)`.
 The handler instance is injected with a `self.task_handle` attribute post-instantiation.
 Progress tracking and task interrupting are handled automatically by the dispatcher.
-If you require manual interrupting during tight loops you can call 
+If you require manual interrupting during tight loops you can call
 `self.task_handle.checkpoint()`
 
 ```python
@@ -194,7 +196,7 @@ class RebuildResult(NamedTuple):
     target_data: bytes | None = None
 ```
 
-`payload`: new bytes for the node being rebuilt.  
+`payload`: new bytes for the node being rebuilt.
 `target_data`: new bytes for `node.target`. The navigator writes these
 to `target_node.pending_data` and adds it to the rebuild queue.
 
@@ -525,8 +527,8 @@ Implement a history manager (custom or `QUndoStack`) and wire it to
 `undo_state_changed`. EditorPage shows the Undo/Redo buttons the first time it fires and
 hides them when both are `False`.
 
-The dirty state must always be driven by **explicit `set_dirty()` calls**. 
-Call `set_dirty(True)` when a change is recorded, and`set_dirty(False)` after a successful 
+The dirty state must always be driven by **explicit `set_dirty()` calls**.
+Call `set_dirty(True)` when a change is recorded, and`set_dirty(False)` after a successful
 save or a full revert. For more complete examples of custom and QUndoStack implementations see HexEditor and FisEditor respectively.
 
 ```python
@@ -569,7 +571,7 @@ class MyEditor(BaseEditor):
 ### BaseViewer
 
 Convenience subclass for immutable plugins.
-`BaseViewer(BaseEditor)` with `is_mutable = False`. 
+`BaseViewer(BaseEditor)` with `is_mutable = False`.
 
 `set_dirty` is a no-op so `dataChanged` is never emitted. Save,
 Revert, Undo, and Redo are hidden by EditorPage automatically.
