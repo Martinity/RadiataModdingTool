@@ -1,8 +1,6 @@
 # Overview
 
-A desktop application for modding _Radiata Stories_. This application automatically manages the game's file system in-memory, allowing you to modify, extract, and analyze game data without cluttering your local machine with thousands of extracted files. 
-
-It is built with a plugin system, allowing developers to support new file formats, custom data handlers, and editors without needing to rebuild the core application (see `documentation.md` for plugin authoring).
+A desktop application for modding _Radiata Stories_. This application automatically manages the disk's file system in-memory, allowing you to modify, extract, and analyze game data without cluttering your local machine with thousands of extracted files. 
 
 ## Use Cases
 
@@ -10,28 +8,32 @@ It is built with a plugin system, allowing developers to support new file format
 - __Datamining__: Browse the file tree, search for specific files, and extract unmodified game files directly to your PC.
 - __Asset Modding__: Utilize built-in editors to modify assets on the fly, or use format handlers to translate between proprietary game formats and standard formats.
 
-## Limitations
-
-- The tool currently only manages the game's internal VFS. Modifications to game data outside of this file system are not yet supported.
-- Successfully building an ISO does _not_ guarantee that the game will boot or run correctly with those modifications. It is highly recommended to make small, incremental modifications and verify them in-game as you go.
-
 ## List of current Plugins
 
 | Plugin            | Format Support          | Features                     |
 |-------------------|-------------------------|------------------------------|
 | **Texture Editor**| `.fis`                  | Edit & export as PNG         |
 | **Audio Player**  | `.020`                  | Playback + WAV export        |
+| **Event Editor**  | `.evd`                  | Parses script bytes into a readable and editable table |
+| **Message Editor**  | `.rmf`                  | *Experimental*: change ingame messages        |
 | **Hex Editor**    | Any file                | Raw binary editing           |
+
+## List of current Patches
+
+| Patch | Description |
+|-------|-------------|
+| Slimmed | Cut the non-essential sections of the disk out saving ~1GB |
 
 ## Technical Specifications
 - __Languages__: Python, C (heavy data processing)
-- __GUI__: Qt/PyQt6
-- __Build__: Automated Windows and Linux CI releases with smoke testing via PyInstaller.
+- __GUI__: PyQt6
+- __Build__: Automated Windows and Linux CI releases with smoke testing via PyInstaller. MacOS support is questionable.
 
 ### Acknowledgements
 
 Special thanks to project contributors and CUE.
-Unofficial and not associated with Square Enix or tri-Ace
+
+Unofficial and not associated with Square Enix or tri-Ace.
 
 ## Screenshots
 <img width="620" height="480" alt="image" src="https://github.com/user-attachments/assets/1a2e7d3e-5570-445a-ae9c-cdbf0a4fb7bd" />
