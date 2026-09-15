@@ -18468,5 +18468,33 @@ class EVDHandler(LeafHandler):
             f'size: {stats.byte_size} bytes'
         )
 
-    def skip_cutscenes(self, node: VfsNode) -> None:
-        raise NotImplementedError('Cutscene skipping is not yet implemented')
+    def skip_cutscenes(self, node: VfsNode) -> bytes:
+        keep_heads = {
+            'event', 'set_value', 'set_flag', 'clear_flag', 'if_value', 'if_flag',
+            'jump', 'set_game_clock', 'change_inventory', 'trigger', 'branch',
+            'nop', 'change_map', 'stop_script', 'start_script', 'unless_value',
+            'change_game_mode_and_flags', 'end_script', 'configure_battle',
+            'add_battle_character', 'bytes', 'header', 'headerExtra', 'header_extra',
+            'entry', 'label', 'set_background_visibility', 'load_background', 'start_script_stacked',
+            'play_fmv', 'play_movie', 'stop_movie'
+        }
+        if not self._raw.startswith(EVD_MAGIC):
+            raise EvdError(f'{node.name} is not an EVD script (expected magic {EVD_MAGIC!r})')
+        try:
+            code = decompile_code(self._raw, node.name)
+        except Exception as e:
+            raise EvdError(f'Failed to decompile EVD code: {e}')
+
+        lines = parse_code(code)
+        out: list[str] = []
+        for line in lines:
+            if line.kind != KIND_COMMAND or line.opens or line.closes:
+                out.append(line.text)
+                continue
+            if line.head in keep_heads:
+                out.append(line.text)
+                continue
+            # logger.debug(f'Skipping {line.text.strip()}')
+            # out.append(' ' * line.indent + 'nop()')
+
+        return compile_code('\n'.join(out) + '\n')

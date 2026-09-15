@@ -266,11 +266,6 @@ class EvdEditor(BaseEditor):
                     args = line.args[:i] + (Arg(key=arg.key, value=selected_label),) + line.args[i+1:]
                     break
 
-            # if 'goto' in [arg for arg in line.args]:
-            #     key = 'goto'
-            # else:
-            #     key = 'target'
-            # arg = Arg(key=key, value=selected_label)
             self._apply_line_args(target_line, args, 'goto')
             # Re-render the full code with the modified line and apply the change
             code = evd_leaf.render_code(self._lines)
