@@ -1,5 +1,6 @@
 name: Release
 # MAINTAINER-GATED: triggers only on v* tags. Confirm versioning/branching before tagging.
+# For patch notes or version updates, write to .github/workflows/patch_notes.md
 on:
   push:
     tags: ['v*']
