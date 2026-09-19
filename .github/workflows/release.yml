@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 jobs:
-  release:
+  build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -76,12 +76,49 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: sha256sum *.AppImage > SHA256SUM-linux-x86_64.txt
-      - name: Publish to Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
         with:
-          generate_release_notes: true
-          files: |
+          name: release-assets-${{ matrix.label }}
+          path: |
             *.AppImage
             *.dmg
             *.zip
             SHA256SUM-*
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-assets-*
+          merge-multiple: true
+
+      - name: Prepare Release Body
+        id: prep_notes
+        shell: bash
+        run: |
+          NOTES_FILE=".github/workflows/patch_notes.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "NOTES<<EOF" >> $GITHUB_ENV
+            cat "$NOTES_FILE" >> $GITHUB_ENV
+            echo -e "\n\nFor further installation instructions and binary verification, please refer to the [README](https://github.com/${{ github.repository }}#installation)." >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            echo "NOTES=For further installation instructions and binary verification, please refer to the [README](https://github.com/${{ github.repository }}#installation)." >> $GITHUB_ENV
+          fi
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: release-assets/*
+          body: ${{ env.NOTES }}
