@@ -79,35 +79,9 @@ jobs:
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             *.AppImage
             *.dmg
             *.zip
             SHA256SUM-*
-          body: |
-            ### Installation Instructions - ${{ github.ref_name }}
-
-            **Windows User Note:**
-            This build is unsigned. Windows SmartScreen will show a warning alert.
-            Click **More info** → **Run anyway** to launch the tool.
-
-            **Linux User Note:**
-            Make the AppImage executable before launching:
-            ```bash
-            chmod +x RadiataModdingTool-*.AppImage
-            ./RadiataModdingTool-*.AppImage
-            ```
-
-            **macOS User Note:**
-            This build is unsigned. macOS Gatekeeper will block execution by default.
-            If blocked, clear the quarantine flag with:
-              ```bash
-              xattr -cr /path/to/RadiataModdingTool.app
-              ```
-            Or **Control-click (Right-click)** on the app icon and select **Open** from the context menu.
-
-            ### Integrity Verification (Optional)
-            Verify your downloads match the compile-time binary fingerprints:
-            - **macOS:** `shasum -a 256 -c SHA256SUM-macos-arm64.txt`
-            - **Linux:** `sha256sum -c SHA256SUM-linux-x86_64.txt`
-            - **Windows (PowerShell):** `Get-FileHash .\RadiataModdingTool-*.zip` compare to `SHA256SUM-windows-x64.txt`
