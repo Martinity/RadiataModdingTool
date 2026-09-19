@@ -1,6 +1,6 @@
 # Overview
 
-A desktop application for modding _Radiata Stories_. This application automatically manages the disk's file system in-memory, allowing you to modify, extract, and analyze game data without cluttering your local machine with thousands of extracted files. 
+A desktop application for modding _Radiata Stories_. This application automatically manages the disk's file system in-memory, allowing you to modify, extract, and analyze game data without cluttering your local machine with thousands of extracted files.
 
 ## Use Cases
 
@@ -29,14 +29,41 @@ A desktop application for modding _Radiata Stories_. This application automatica
 - __GUI__: PyQt6
 - __Build__: Automated Windows and Linux CI releases with smoke testing via PyInstaller. MacOS support is questionable.
 
-### Acknowledgements
+# Installation
+
+## Windows
+
+This build is unsigned. Windows SmartScreen will show a warning alert.
+Click More info → Run anyway to launch the tool.
+
+## Linux
+
+Install with preferred AppImage manager _or_ make the AppImage executable before launching:
+
+``` bash
+chmod +x RadiataModdingTool-*.AppImage
+./RadiataModdingTool-*.AppImage
+```
+
+## macOS
+
+This build is unsigned. macOS Gatekeeper will block execution by default.
+If blocked, Control-click (Right-click) on the app icon and select Open from the context menu _or_ clear the quarantine flag with:
+
+``` zsh
+xattr -cr /path/to/RadiataModdingTool.app
+```
+
+## Build Integrity Verification (Optional)
+
+Verify your downloads match the compile-time binary fingerprints:
+
+- Windows (PowerShell): `Get-FileHash .\RadiataModdingTool-*.zip` compare to the SHA256SUM-windows-x64.txt stored sting
+- Linux: `sha256sum -c SHA256SUM-linux-x86_64.txt`
+- macOS: `shasum -a 256 -c SHA256SUM-macos-arm64.txt`
+
+## Acknowledgements
 
 Special thanks to project contributors and CUE.
 
 Unofficial and not associated with Square Enix or tri-Ace.
-
-## Screenshots
-<img width="620" height="480" alt="image" src="https://github.com/user-attachments/assets/1a2e7d3e-5570-445a-ae9c-cdbf0a4fb7bd" />
-<img width="620" height="480" alt="image" src="https://github.com/user-attachments/assets/b2f334ca-a1ec-4edc-bd46-edcd6a7abf90" />
-
-

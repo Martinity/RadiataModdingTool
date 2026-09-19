@@ -773,7 +773,7 @@ class MainMenuBar:
             self._patch_flags.append((checkbox, flag))
 
         add_patch_box('Slimmed rebuild', 'Save 1GB by trimming out unused disk space.', IsoRebuildFlags.SLIMMED)
-        # add_patch_box('Cutscene skipper', 'Patch all story scripts to complete ASAP.', IsoRebuildFlags.CUTSCENE_SKIPPER)
+        add_patch_box('Cutscene skipper', 'Patch all story scripts to complete ASAP.', IsoRebuildFlags.CUTSCENE_SKIPPER)
 
         patches_menu.addSeparator()
         self.apply_patches = QAction('Apply patches', self.window)

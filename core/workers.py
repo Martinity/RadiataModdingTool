@@ -60,7 +60,7 @@ class IsoRebuildFlags(Flag):
     '''
     NONE              = 0
     SLIMMED           = auto()
-    # CUTSCENE_SKIPPER  = auto()
+    CUTSCENE_SKIPPER  = auto()
 
 class ActionType(Enum):
     '''
@@ -428,7 +428,7 @@ class TaskHandle(QObject):
 ###-------------------------------------- Rebuild Patches ------------------------------------###
 
 REBUILD_PATCH_ACTIONS: dict[IsoRebuildFlags, str] = {
-    # IsoRebuildFlags.CUTSCENE_SKIPPER: 'Skip cutscenes',
+    IsoRebuildFlags.CUTSCENE_SKIPPER: 'Skip cutscenes',
 }
 
 ###---------------------------------------- Actions --------------------------------------###

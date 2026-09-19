@@ -790,7 +790,7 @@ class PatchTargetRule:
     parent_hid: tuple[int, ...]
 
 PATCH_TARGET_RULES: dict[IsoRebuildFlags, PatchTargetRule] = {
-    # IsoRebuildFlags.CUTSCENE_SKIPPER: PatchTargetRule(action='Skip cutscenes', parent_hid=(186,)),
+    IsoRebuildFlags.CUTSCENE_SKIPPER: PatchTargetRule(action='Skip cutscenes', parent_hid=(186,)),
 }
 
 class RebuildCoordinator(QObject):
