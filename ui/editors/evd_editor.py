@@ -326,6 +326,7 @@ class EvdEditor(BaseEditor):
         if not isinstance(result, EvdEditorPayload):
             self.show_error(f'Unexpected result type: {type(result).__name__}, expected EvdEditorPayload')
             return
+        logger.debug(result)
         self._original_payload = result
         self._raw    = result.raw
         self._stats  = result.stats
@@ -339,13 +340,19 @@ class EvdEditor(BaseEditor):
             self._set_status(f'Loaded {result.name} -- {result.stats.summary()}', error=False)
         logger.info(f'[gen {self._generation}] loaded {result.name}: {result.stats.summary()}')
 
-    def _populate_ui(self, data: EvdEditorPayload) -> None:
+    def _populate_ui(self, data: EvdEditorPayload | EvdSavePayload) -> None:
         self._code = data.code
-        self._lines = list(data.lines)
-        self._offsets = dict(data.offsets)
-        self._refresh_views(preserve_selection=False)
-        self._lowered.set_text(data.source)
-        self._problems.clear()
+        if isinstance(data, EvdSavePayload):
+            self._lines = evd_leaf.parse_code(data.code)
+            self._offsets = {}
+            self._refresh_views(preserve_selection=False)
+            self._validate_timer.start()
+        else:
+            self._lines = list(data.lines)
+            self._offsets = dict(data.offsets)
+            self._refresh_views(preserve_selection=False)
+            self._lowered.set_text(data.source)
+            self._problems.clear()
         self._emit_undo_state()
 
     def show_error(self, message: str) -> None:
