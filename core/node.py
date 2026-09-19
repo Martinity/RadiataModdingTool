@@ -56,8 +56,9 @@ class VfsNode:
         self.parent   = parent                              # parent node (None = Root)
         self.children: list[VfsNode] = []                   # children node(s)
 
-        self.offset = offset                                # Relative offset into parent
-        self.size   = size                                  # Size of node in bytes (VirtualFile=disk[offset:offset+size])
+        # offset and size are set synchronously at init but are lock protected after since they are mutable from background threads
+        self._offset = offset                               # Relative offset into parent
+        self._size   = size                                 # Size of node in bytes (VirtualFile=disk[offset:offset+size])
         self.target: tuple[int,...] | None = target         # Header HID for unpacking datacenter
 
         self.extension = extension                          # extension from override saved in radi_metadata
@@ -138,6 +139,26 @@ class VfsNode:
         '''Set the pending data for this node'''
         with self._lock:
             self._pending_data = value
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return self._size
+
+    @size.setter
+    def size(self, value: int) -> None:
+        with self._lock:
+            self._size = value
+
+    @property
+    def offset(self) -> int:
+        with self._lock:
+            return self._offset
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        with self._lock:
+            self._offset = value
 
     @property
     def hierarchical_id(self) -> tuple[int, ...]:
