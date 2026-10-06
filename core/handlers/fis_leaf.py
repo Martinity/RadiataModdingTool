@@ -60,16 +60,17 @@ class FISInfo:
     @property
     def special_layout(self) -> bool:
         return bool(self.flags & FIS_FLAG_SPECIAL)
-    
+
     def summary(self) -> str:
         return (
             f'Name:         {self.name!r}\n'
             f'PSM:          {self.psm_name} ({self.bpp}bpp)\n'
             f'Dimensions:   {self.width}×{self.height}\n'
             f'Swizzled:     {self.swizzled}\n'
-            f'Padded CLUT:  {self.padded_4bpp_clut}'
+            f'Padded CLUT:  {self.padded_4bpp_clut}\n'
+            f'CLUT size:    {self.palette_storage_size}'
         )
-    
+
 class FisEditorPayload(NamedTuple):
     '''Structured result to pass to the editor'''
     image:      QImage    # Displayable image
@@ -155,7 +156,7 @@ def _swizzle_psmt8(src: bytes | bytearray, width: int, height: int) -> bytearray
             li = y * width + x
             if si < len(dst) and li < len(src):
                 # Write linear src index back into swizzled dst index
-                dst[si] = src[li] 
+                dst[si] = src[li]
     return dst
 
 def _pack_4bpp(indices: bytes, width: int, height: int) -> bytearray:
@@ -188,6 +189,33 @@ def parse_fis(data: bytes, *, swizzled: bool | None = None, padded_4bpp: bool | 
     name                = data[0x14:0x18].decode('ascii', errors='replace').strip('\0')
     pre_image_size      = _u32(data, 0x1C)
     pal_storage_size    = _u32(data, 0x20)
+
+    if pal_storage_size == 0: # PSMCT32 Direct-Color check
+        if len(data) < 0x108:
+            raise ValueError('Invalid PSMCT32 FIS payload (too small)')
+        # Extract dimensions from the 64-bit TRXREG at offset 0xC0
+        trxreg = struct.unpack_from('<Q', data, 0xC0)[0]
+        w = trxreg & 0xFFF
+        h = (trxreg >> 32) & 0xFFF
+        return FISInfo(
+            name=name,
+            flags=flags,
+            psm=0x00,
+            psm_name='PSMCT32',
+            bpp=32,
+            width=w,
+            height=h,
+            raw_width=w,
+            raw_height=h,
+            dimension_mode='trxreg_direct',
+            swizzled=False,
+            padded_4bpp_clut=False,
+            palette_offset=None,
+            palette_storage_size=0,
+            image_offset=0x100,
+            image_size=w * h * 4,
+        )
+
     img_hdr_off         = pre_image_size + 0x10
     if img_hdr_off + 0x10 > len(data):
         raise ValueError('Invalid FIS payload')
@@ -242,21 +270,21 @@ def parse_fis(data: bytes, *, swizzled: bool | None = None, padded_4bpp: bool | 
         )
 
     return FISInfo(
-        name=name, 
-        flags=flags, 
+        name=name,
+        flags=flags,
         psm=psm,
         psm_name=_PSM_NAMES.get(psm, f'UNKNOWN_{psm:#04x}'),
-        bpp=bpp_val, 
-        width=w, 
-        height=h, 
-        raw_width=raw_w, 
+        bpp=bpp_val,
+        width=w,
+        height=h,
+        raw_width=raw_w,
         raw_height=raw_h,
-        dimension_mode=dim_mode, 
+        dimension_mode=dim_mode,
         swizzled=bool(swizzled),
         padded_4bpp_clut=bool(padded_4bpp),
-        palette_offset=pal_off, 
+        palette_offset=pal_off,
         palette_storage_size=pal_storage_size,
-        image_offset=setup_off + 0x90, 
+        image_offset=setup_off + 0x90,
         image_size=image_size,
     )
 
@@ -286,6 +314,15 @@ def decode_fis(
         raise ValueError(f'Truncated FIS: need 0x{end:X} bytes, have 0x{len(data):X}')
 
     w, h = info.width, info.height
+
+    if info.psm == 0x00 and info.bpp == 32: # PSCMCT32 Direct-Color loading
+        pixel_data = bytearray(data[info.image_offset: info.image_offset + info.image_size])
+        # Scale PS2 alpha (0-128) to standard (0-255)
+        for i in range(3, len(pixel_data), 4):
+            pixel_data[i] = _ps2_alpha(pixel_data[i])
+        img = QImage(bytes(pixel_data), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+        return img, info
+
     if info.bpp == 8:  # 8-bit per pixel
         if info.palette_offset is None or len(data) < info.palette_offset + 0x400:
             raise ValueError('Insufficient 8bpp CLUT data')
@@ -332,81 +369,95 @@ class FisHandler(LeafHandler):
     def prepare_editor_data(self, node: VfsNode, raw_bytes: bytes) -> Any:
         img, info = decode_fis(raw_bytes)
         return FisEditorPayload(image=img, info=info, raw_bytes=raw_bytes)
-    
+
     def decode_editor_data(self, node: VfsNode, payload: Any, **kwargs) -> bytes:
         '''Transforms QImage and modified CLUT back into raw FIS bytes'''
         if isinstance(payload, bytes):
             return payload
-        
+
         if isinstance(payload, FisEditorPayload):
             img, original_bytes = payload.image, payload.raw_bytes
         elif isinstance(payload, tuple) or len(payload) == 2:
             img, original_bytes = payload
         else:
             raise TypeError(f"{self.__class__.__name__} expects a tuple of (QImage, original_bytes)")
-        
+
         info = parse_fis(original_bytes)
         w, h = info.width, info.height
-        
+
         # 1. Safely extract indices respecting QImage stride padding!
         bpl = img.bytesPerLine()
         ptr = img.bits()
         ptr.setsize(bpl * h)
         raw_bits = bytes(ptr)
-        
-        indices = bytearray()
-        for y in range(h):
-            indices.extend(raw_bits[y * bpl : y * bpl + w])
-        
-        # 2. Pack and Re-swizzle indices
-        if info.bpp == 8:
-            pixel_data = bytearray(indices)
-            if info.swizzled:
-                pixel_data = _swizzle_psmt8(pixel_data, w, h)
-                
-        elif info.bpp == 4:
-            pixel_data = _pack_4bpp(bytes(indices), w, h)
-            if info.swizzled:
-                # 4bpp swizzling maps over packed memory, so width is halved
-                pixel_data = _swizzle_psmt8(pixel_data, w // 2, h) 
-        else:
-            raise NotImplementedError(f"Repacking not supported for {info.psm_name}")
-            
-        # 3. Splice the modified pixel block back into the exact location
+
         out_bytes = bytearray(original_bytes)
-        start = info.image_offset
-        end = start + info.image_size
-        out_bytes[start:end] = pixel_data[:info.image_size]
-        
-        # 4. Serialize CLUT changes back to the binary
-        if info.palette_offset is not None:
-            qt_palette = img.colorTable()
-            pal_off = info.palette_offset
-            
+        if info.psm == 0x00 and info.bpp == 32: # PSMCT32 Direct-Color
+            pixel_data = bytearray()
+            for y in range(h):
+                pixel_data.extend(raw_bits[y * bpl : y * bpl + w * 4])
+
+            # Scale standard Alpha (0-255) back to PS2 Alpha (0-128)
+            for i in range(3, len(pixel_data), 4):
+                pixel_data[i] = pixel_data[i] >> 1
+
+            start = info.image_offset
+            end = start + info.image_size
+            out_bytes[start:end] = pixel_data[:info.image_size]
+
+        else: # PSMT8/PSMT4
+            indices = bytearray()
+            for y in range(h):
+                indices.extend(raw_bits[y * bpl : y * bpl + w])
+
+            # 2. Pack and Re-swizzle indices
             if info.bpp == 8:
-                # Re-interleave the palette array and scale Qt Alpha (0-255) back to PS2 (0-128)
-                pal = [(qRed(c), qGreen(c), qBlue(c), qAlpha(c) >> 1) for c in qt_palette]
-                pal += [(0, 0, 0, 0)] * (256 - len(pal)) # Ensure 256 colors
-                pal = _clut_interleave(pal)
-                
-                max_pal_bytes = len(out_bytes) - pal_off
-                entries_safe = min(256, max_pal_bytes // 4)
-                for i, (r, g, b, a) in enumerate(pal[:entries_safe]):
-                    struct.pack_into('4B', out_bytes, pal_off + i * 4, r, g, b, a)
-                    
+                pixel_data = bytearray(indices)
+                if info.swizzled:
+                    pixel_data = _swizzle_psmt8(pixel_data, w, h)
+
             elif info.bpp == 4:
-                for i, c in enumerate(qt_palette[:16]):
-                    r, g, b, a = qRed(c), qGreen(c), qBlue(c), qAlpha(c) >> 1
-                    pos = pal_off + i * 4
-                    if info.padded_4bpp_clut and i >= 8:
-                        pos += 0x20
-                    struct.pack_into('4B', out_bytes, pos, r, g, b, a)
-        
+                pixel_data = _pack_4bpp(bytes(indices), w, h)
+                if info.swizzled:
+                    # 4bpp swizzling maps over packed memory, so width is halved
+                    pixel_data = _swizzle_psmt8(pixel_data, w // 2, h)
+            else:
+                raise NotImplementedError(f"Repacking not supported for {info.psm_name}")
+
+            # 3. Splice the modified pixel block back into the exact location
+            start = info.image_offset
+            end = start + info.image_size
+            out_bytes[start:end] = pixel_data[:info.image_size]
+
+            # 4. Serialize CLUT changes back to the binary
+            if info.palette_offset is not None:
+                qt_palette = img.colorTable()
+                pal_off = info.palette_offset
+
+                if info.bpp == 8:
+                    # Re-interleave the palette array and scale Qt Alpha (0-255) back to PS2 (0-128)
+                    pal = [(qRed(c), qGreen(c), qBlue(c), qAlpha(c) >> 1) for c in qt_palette]
+                    pal += [(0, 0, 0, 0)] * (256 - len(pal)) # Ensure 256 colors
+                    pal = _clut_interleave(pal)
+
+                    max_pal_bytes = len(out_bytes) - pal_off
+                    entries_safe = min(256, max_pal_bytes // 4)
+                    for i, (r, g, b, a) in enumerate(pal[:entries_safe]):
+                        struct.pack_into('4B', out_bytes, pal_off + i * 4, r, g, b, a)
+
+                elif info.bpp == 4:
+                    for i, c in enumerate(qt_palette[:16]):
+                        r, g, b, a = qRed(c), qGreen(c), qBlue(c), qAlpha(c) >> 1
+                        pos = pal_off + i * 4
+                        if info.padded_4bpp_clut and i >= 8:
+                            pos += 0x20
+                        struct.pack_into('4B', out_bytes, pos, r, g, b, a)
+
         if node.size != len(out_bytes):
             logger.warning('Size of FIS texture has changed dispite texture resizing not implemented.')
         logger.debug(f'Original length: {node.size} New Length: {len(out_bytes)}')
         return bytes(out_bytes)
-    
+
     def execute_action(
         self,
         node:        VfsNode,

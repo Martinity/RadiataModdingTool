@@ -86,10 +86,11 @@ class ThreadLocalAlignedBuffer:
 
     Current scratch preallocated: 2MB + 64KB
     '''
-    def __init__(self, lib, capacity: int = (1024 * 1024 * 64) + (1024 * 64)) -> None:
+    def __init__(self, lib, capacity: int = (1024 * 1024 * 64) + (1024 * 64), alignment: int = 2048) -> None:
         self._lib = lib
         self.capacity = capacity
-        self.ptr = self._lib.alloc_aligned_buffer(capacity, 2048)
+        self.alignment = alignment
+        self.ptr = self._lib.alloc_aligned_buffer(capacity, alignment)
         if not self.ptr:
             raise MemoryError(f'Failed to allocate {capacity} aligned bytes')
         weakref.finalize(self, self._lib.free_aligned_buffer, self.ptr)
@@ -102,6 +103,7 @@ class BlockDevice:
     def __init__(self, path: str | Path, sector_size: int = 2048) -> None:
         self.path        = Path(path)
         self.sector_size = sector_size
+        self.alignment   = max(sector_size, 2048)
         self._lib        = get_block_device_lib()
         path_bytes       = str(self.path).encode(sys.getfilesystemencoding() or 'utf-8')
         self._dev_handle = self._lib.open_device(path_bytes, sector_size)
@@ -119,7 +121,7 @@ class BlockDevice:
     def _scratch_buffer(self) -> ThreadLocalAlignedBuffer:
         '''Fetch or create a persistent C-allocated buffer for the current thread'''
         if not hasattr(self._tls, 'buf'):
-            self._tls.buf = ThreadLocalAlignedBuffer(self._lib)
+            self._tls.buf = ThreadLocalAlignedBuffer(self._lib, alignment=self.alignment)
         return self._tls.buf
 
     def _requires_large_read(self, offset: int, size: int, capacity: int) -> bool:
@@ -245,6 +247,27 @@ class BlockDevice:
     @property
     def size(self) -> int:
         return self._size
+
+    def reopen(self, sector_size: int) -> None:
+        '''
+        Reopens the device with the appropriate sector size post detection.
+        Invalidates thread cached scratch buffer to ensure thread safety.
+        '''
+        if self.closed or not self._dev_handle:
+            raise ValueError('Cannot reopen a closed BlockDevice')
+        if sector_size == self.sector_size:
+            return
+        self._lib.close_device(self._dev_handle)
+        path_bytes = str(self.path).encode(sys.getfilesystemencoding() or 'utf-8')
+        self._dev_handle = self._lib.open_device(path_bytes, sector_size)
+        if not self._dev_handle:
+            raise ValueError(f'Failed to reopen BlockDevice, {self.path} with sector_size={sector_size}')
+        self.sector_size = sector_size
+        self.alignment   = max(sector_size, 2048)
+        self._size       = self._lib.get_device_size(self._dev_handle)
+        self._tls        = threading.local()
+        print(f'Reopened {self.path.name} with sector_size={sector_size} (alignment={self.alignment})')
+
 
     def close(self) -> None:
         if not self.closed and getattr(self, '_dev_handle', None):

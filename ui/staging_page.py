@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from core.node import ModTracker, VfsNode
-from core.workers import IsoRebuildFlags
+from core.node import ModTracker, ModGroup, ConflictInfo
+from core.contracts import SourceRebuildFlags
 from ui.settings import Shortcut, Shortcuts
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QShortcut
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -88,6 +89,7 @@ def _make_hex_view(model: HexDiffModel) -> QTableView:
 class HexDiffPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._entries: list[tuple[str, bytes, bytes]] = []
         self._setup_ui()
         self.clear()
 
@@ -105,6 +107,9 @@ class HexDiffPanel(QWidget):
         self._node_label = QLabel('Select a modified file')
         self._node_label.setObjectName('TextHeader')
         self._stats_label = QLabel('')
+        self._member_combo = QComboBox()
+        self._member_combo.setToolTip('Nodes changed together as one package')
+        self._member_combo.currentIndexChanged.connect(self._on_member_changed)
 
         legend = QHBoxLayout()
         legend.setSpacing(4)
@@ -121,6 +126,7 @@ class HexDiffPanel(QWidget):
             legend.addSpacing(6)
 
         stats_layout.addWidget(self._node_label)
+        stats_layout.addWidget(self._member_combo)
         stats_layout.addStretch()
         stats_layout.addWidget(self._stats_label)
         stats_layout.addStretch(12)
@@ -165,6 +171,27 @@ class HexDiffPanel(QWidget):
 
     ###-------------------------------- Public -------------------------------------###
 
+    def load_group(self, entries: list[tuple[str, bytes, bytes]]) -> None:
+        self._entries = list(entries)
+        self._member_combo.blockSignals(True)
+        self._member_combo.clear()
+        for label, _, _ in self._entries:
+            self._member_combo.addItem(label)
+        self._member_combo.blockSignals(False)
+        self._member_combo.setVisible(len(self._entries) > 1)
+        if self._entries:
+            self._show_entry(0)
+        else:
+            self.clear()
+
+    def _on_member_changed(self, index: int) -> None:
+        if 0 <= index < len(self._entries):
+            self._show_entry(index)
+
+    def _show_entry(self, index: int) -> None:
+        label, new_data, orig_data = self._entries[index]
+        self.load_diff(label, new_data, orig_data)
+
     def load_diff(self, node_name: str, new_data: bytes, orig_data: bytes) -> None:
         new_mask, orig_mask = HexDiffModel.build_masks(new_data, orig_data)
 
@@ -191,6 +218,11 @@ class HexDiffPanel(QWidget):
         self._stats_label.setText(', '.join(parts) if parts else 'No differences')
 
     def clear(self) -> None:
+        self._entries = []
+        self._member_combo.blockSignals(True)
+        self._member_combo.clear()
+        self._member_combo.blockSignals(False)
+        self._member_combo.setVisible(False)
         self._new_model = HexDiffModel(b'', [])
         self._orig_model = HexDiffModel(b'', [])
         self._new_view.setModel(self._new_model)
@@ -211,11 +243,11 @@ class StagingPage(QWidget):
 
     def __init__(self, dispatcher, rebuild_coordinator, parent=None) -> None:
         super().__init__(parent)
-        self.dispatcher = dispatcher
+        self.dispatcher          = dispatcher
         self.rebuild_coordinator = rebuild_coordinator
         self.tracker: ModTracker = self.dispatcher.tracker
-        self._selected_node: VfsNode | None = None
-        self._build_flags = IsoRebuildFlags.NONE
+        self._selected_group_key: str | None = None
+        self._option_boxes:       dict[SourceRebuildFlags, QCheckBox] = {}
         self._setup_ui()
         self._connect_signals()
         self._setup_shortcuts()
@@ -285,20 +317,24 @@ class StagingPage(QWidget):
         lists_row.addLayout(staged_col, stretch=1)
         top_layout.addLayout(lists_row)
 
+        self.conflict_label = QLabel('')
+        self.conflict_label.setWordWrap(True)
+        self.conflict_label.setStyleSheet(f'color: {_COL_REMOVED_FG.name()}')
+        self.conflict_label.setVisible(False)
+        top_layout.addWidget(self.conflict_label)
+
         action_bar = QHBoxLayout()
         action_bar.setContentsMargins(6, 6, 6, 6)
         self.btn_back = QPushButton('< Back')
         self.btn_back.setToolTip(Shortcuts.text(Shortcut.BACK))
-        self.slim_toggle = QCheckBox('Slimmed Rebuild')
-        self.slim_toggle.setToolTip(
-            'Removes all non-essential disk data.\nMeant for digital use only.'
-        )
+        self._patches_layout = QHBoxLayout()
+        self._patches_layout.setSpacing(16)
         self.btn_confirm = QPushButton('Build New ISO')
         self.btn_confirm.setObjectName('BtnImportant')
         self.btn_confirm.setEnabled(False)
         action_bar.addWidget(self.btn_back)
         action_bar.addStretch()
-        action_bar.addWidget(self.slim_toggle)
+        action_bar.addLayout(self._patches_layout)
         action_bar.addSpacing(24)
         action_bar.addWidget(self.btn_confirm)
         top_layout.addLayout(action_bar)
@@ -322,94 +358,129 @@ class StagingPage(QWidget):
 
         self.tracker.state_changed.connect(self.refresh_lists)
         self.btn_confirm.clicked.connect(self._on_confirm)
-        self.slim_toggle.stateChanged.connect(self._on_slim_toggled)
+        self.dispatcher.source_loaded.connect(lambda *_: self.refresh_patch_options())
+        self.dispatcher.source_closed.connect(self.refresh_patch_options)
 
         self.unstaged_list.currentItemChanged.connect(self._on_item_changed)
         self.staged_list.currentItemChanged.connect(self._on_item_changed)
 
     def _on_confirm(self) -> None:
-        if not self.tracker.rebuild_queue:
+        staged = self.tracker.staged_nodes()
+        flags  = self.build_flags()
+        if not staged or flags is None:
             return
-        self.rebuild_coordinator.request_rebuild(list(self.tracker.rebuild_queue), self._build_flags)
+        self.rebuild_coordinator.request_rebuild(staged, flags)
 
-    def _on_slim_toggled(self) -> None:
-        if self.slim_toggle.isChecked():
-            self._build_flags |= IsoRebuildFlags.SLIMMED
-        else:
-            self._build_flags &= ~IsoRebuildFlags.SLIMMED
+    ###---------------------------------- Patch Options --------------------------------------###
 
+    def showEvent(self, a0) -> None:
+        super().showEvent(a0)
+        self.refresh_patch_options()
+
+    def refresh_patch_options(self) -> None:
+        options = self.dispatcher.get_patch_options()
+        if [option.flag for option in options] == list(self._option_boxes):
+            return
+        previous = {flag: box.isChecked() for flag, box in self._option_boxes.items()}
+        for box in self._option_boxes.values():
+            self._patches_layout.removeWidget(box)
+            box.deleteLater()
+        self._option_boxes.clear()
+        for option in options:
+            box = QCheckBox(option.name)
+            box.setToolTip(option.description)
+            box.setChecked(previous.get(option.flag, False))
+            self._patches_layout.addWidget(box)
+            self._option_boxes[option.flag] = box
+
+    def build_flags(self) -> SourceRebuildFlags | None:
+        return self.dispatcher.compose_build_flags(
+            flag for flag, box in self._option_boxes.items() if box.isChecked()
+        )
 
     def _setup_shortcuts(self) -> None:
         QShortcut(Shortcuts.sequence(Shortcut.BACK), self).activated.connect(self.request_file_browser.emit)
 
     def refresh_lists(self) -> None:
         """Modifies the list of modified nodes"""
-        selected_hid = self._selected_node.hierarchical_id_str if self._selected_node else None
         self.unstaged_list.clear()
         self.staged_list.clear()
-        for node in sorted(self.tracker.modified_nodes, key=lambda n: n.name):
-            item = _make_item(node)
+        for group in self.tracker.unstaged_groups():
+            item = _make_item(group, self.tracker.group_conflicts(group))
             self.unstaged_list.addItem(item)
-            if selected_hid and node.hierarchical_id_str == selected_hid:
+            if self._selected_group_key == group.primary.hierarchical_id_str:
                 self.unstaged_list.setCurrentItem(item)
-        for node in sorted(self.tracker.rebuild_queue, key=lambda n: n.name):
-            item = _make_item(node)
+        for group in self.tracker.staged_groups():
+            item = _make_item(group, [])
             self.staged_list.addItem(item)
-            if selected_hid and node.hierarchical_id_str == selected_hid:
+            if self._selected_group_key == group.primary.hierarchical_id_str:
                 self.staged_list.setCurrentItem(item)
         self.btn_confirm.setEnabled(len(self.tracker.rebuild_queue) > 0)
 
     def _on_item_changed(self, current: QListWidgetItem, _prev) -> None:
-        if current is None:
-            self._selected_node = None
+        group: ModGroup | None = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        if group is None:
+            self._selected_group_key = None
             self.diff_panel.clear()
             return
-        node: VfsNode | None = current.data(Qt.ItemDataRole.UserRole)
-        if node is None:
-            self._selected_node = None
-            self.diff_panel.clear()
+        self._selected_group_key = group.primary.hierarchical_id_str
+        self.diff_panel.load_group([
+            (f'{node}', node.pending_data or b'', self.tracker.get_original(node))
+            for node in group.members
+        ])
+
+    def _selected_groups(self, widget: QListWidget) -> list[ModGroup]:
+        return [item.data(Qt.ItemDataRole.UserRole) for item in widget.selectedItems()]
+
+    def _show_refusals(self, refused: dict[ModGroup, list[ConflictInfo]]) -> None:
+        if not refused:
+            self.conflict_label.setVisible(False)
             return
-        self._selected_node = node
-        new_data = node.pending_data or b''
-        orig_data = self.tracker.get_original(node)
-        self.diff_panel.load_diff(f'{node}', new_data, orig_data)
+        lines = []
+        for group, conflicts in refused.items():
+            lines.append(f'Not staged: {group.name}')
+            lines.extend(f'    {c.reason}' for c in conflicts)
+        lines.append('Revert one side of the conflict to continue.')
+        self.conflict_label.setText('\n'.join(lines))
+        self.conflict_label.setVisible(True)
 
     def _on_stage(self) -> None:
-        for item in self.unstaged_list.selectedItems():
-            self.tracker.stage_node(item.data(Qt.ItemDataRole.UserRole))
+        refused = {}
+        for group in self._selected_groups(self.unstaged_list):
+            conflicts = self.tracker.stage_group(group)
+            if conflicts:
+                refused[group] = conflicts
+        self._show_refusals(refused)
 
     def _on_stage_all(self) -> None:
-        for node in list(self.tracker.modified_nodes):
-            self.tracker.stage_node(node)
+        self._show_refusals(self.tracker.stage_all())
 
     def _on_unstage(self) -> None:
-        for item in self.staged_list.selectedItems():
-            self.tracker.unstage_node(item.data(Qt.ItemDataRole.UserRole))
+        for group in self._selected_groups(self.staged_list):
+            self.tracker.unstage_group(group)
 
     def _on_unstage_all(self) -> None:
-        for node in list(self.tracker.rebuild_queue):
-            self.tracker.unstage_node(node)
+        self.tracker.unstage_all()
 
     def _on_revert(self) -> None:
-        items = self.unstaged_list.selectedItems() + self.staged_list.selectedItems()
-        for item in items:
-            node = item.data(Qt.ItemDataRole.UserRole)
-            self.tracker.revert_node(node)
-            if node is self._selected_node:
-                self._selected_node = None
-                self.diff_panel.clear()
+        for group in self._selected_groups(self.unstaged_list) + self._selected_groups(self.staged_list):
+            self.tracker.revert_group(group)
+        self.conflict_label.setVisible(False)
 
     def _on_revert_all(self) -> None:
-        all_nodes = list(self.tracker.modified_nodes) + list(self.tracker.rebuild_queue)
-        for node in all_nodes:
-            self.tracker.revert_node(node)
-
-        self._selected_node = None
+        self.tracker.revert_all()
+        self._selected_group_key = None
         self.diff_panel.clear()
+        self.conflict_label.setVisible(False)
 
-
-def _make_item(node: VfsNode) -> QListWidgetItem:
-    item = QListWidgetItem(node.name)
-    item.setData(Qt.ItemDataRole.UserRole, node)
-    item.setToolTip(f'{node.hierarchical_id_str}\n{human_size(node.size)}')
+def _make_item(group: ModGroup, conflicts: list[ConflictInfo]) -> QListWidgetItem:
+    warn = bool(conflicts)
+    item = QListWidgetItem(f'\u26a0 {group.name}' if warn else group.name)
+    item.setData(Qt.ItemDataRole.UserRole, group)
+    lines = [f'{node} ({human_size(node.size)})' for node in group.members]
+    if warn:
+        item.setForeground(QBrush(_COL_REMOVED_FG))
+        lines.append('')
+        lines.extend(conflict.reason for conflict in conflicts)
+    item.setToolTip('\n'.join(lines))
     return item

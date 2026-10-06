@@ -12,7 +12,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from typing import Any
 
-from core.contracts import ContainerHandler, RebuildResult
+from core.contracts import ContainerHandler, PackageResult, ResolvedPackage
 from core.extension_overrides import lookup_extension
 from core.registry import Registry
 from core.node import VfsNode
@@ -20,6 +20,22 @@ from core.workers import ActionDef, ActionType
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
+
+###-------------------------------------------- Roles ------------------------------------------------###
+
+HEADER_ROLE         = 'kods.header'
+SLOT_HEADER_PREFIX  = 'kods.slot_header:'
+
+def slot_header_role(slot_index: int) -> str:
+    return f'{SLOT_HEADER_PREFIX}{slot_index}'
+
+def slot_index_of(role: str) -> int | None:
+    if not role.startswith(SLOT_HEADER_PREFIX):
+        return None
+    try:
+        return int(role.removeprefix(SLOT_HEADER_PREFIX))
+    except ValueError:
+        return None
 
 ###-------------------------------------------- KodsHandler -------------------------------------------###
 
@@ -32,12 +48,20 @@ logger = logging.getLogger(f'radiata.{__name__}')
     ))
 class KodsHandler(ContainerHandler):
     '''Wrapper for Kods archiver class'''
-    def __init__(self, source: bytes, parent: VfsNode, datacenter_header: bytes | None = None) -> None:
+    def __init__(self, source: bytes, parent: VfsNode) -> None:
         super().__init__(source)
         self.handler_parent     = parent
         self.payload_view       = memoryview(self.handle.read())
         self.archiver           = KodsArchiver(self.payload_view)
-        self.datacenter_header  = datacenter_header
+
+    @property
+    def datacenter_header(self) -> bytes | None:
+        return self.package.data.get(HEADER_ROLE) if self.package else None
+
+    def validate_package(self, node: VfsNode, package: ResolvedPackage) -> None:
+        header = package.data.get(HEADER_ROLE)
+        if header and header[:4] != b'Kods':
+            raise ValueError(f'{node}: package header member is not a Kods header')
 
     def get_file_tree(self) -> VfsNode:
         '''System unifies all unpacks to one header thus can unpack generically'''
@@ -91,7 +115,7 @@ class KodsHandler(ContainerHandler):
 
     ###------------------------------------- Rebuild ---------------------------------------------------###
 
-    def rebuild_node(self, node: VfsNode, staged_nodes: list[VfsNode]) -> RebuildResult:
+    def rebuild_node(self, node: VfsNode, staged_nodes: list[VfsNode]) -> PackageResult:
         '''Routes to the correct rebuild strategy based on node state'''
         if not self.task_handle:
             raise RuntimeError(f'No active Task Handle for {self.__class__.__name__}')
@@ -112,7 +136,7 @@ class KodsHandler(ContainerHandler):
         padding = (-len(payload)) & (0x800 - 1)
         payload += b'\x00' * padding
         self.task_handle.log_message.emit(f'{node.hierarchical_id} Rebuilt Kods Archive. Original size:{node.size} New size:{len(payload)}')
-        return RebuildResult(payload, header)
+        return PackageResult(payload, {HEADER_ROLE: header} if header else None)
 
     def build_container(self, children: list[VfsNode]) -> tuple[bytes, bytes]:
         '''
@@ -386,6 +410,20 @@ class KodsHandler(ContainerHandler):
                 new_children[slot_index] = new_child_header
 
         return new_main_header, new_children
+
+    def import_payload(self, node: VfsNode, new_payload: bytes, package: ResolvedPackage) -> PackageResult:
+        main_header = package.data.get(HEADER_ROLE)
+        if not main_header:
+            raise ValueError(f'{node}: no header in package to import against')
+        sub_headers: dict[int, bytes] = {}
+        for role, data in package.data.items():
+            slot = slot_index_of(role)
+            if slot is not None and len(data) > 8:  # Skip empty or small headers
+                sub_headers[slot] = data
+        new_main, new_subs = self.complex_import(node, main_header, new_payload, sub_headers)
+        companions = {HEADER_ROLE: new_main}
+        companions.update({slot_header_role(i): header for i, header in new_subs.items()})
+        return PackageResult(new_payload, companions)
 
     ### ------------------ Properties and Execute actions ------------------------ ###
 

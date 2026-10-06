@@ -15,7 +15,7 @@ import itertools
 import inspect
 import time
 from pathlib import Path
-from enum import auto, Enum, Flag
+from enum import auto, Enum
 from dataclasses import dataclass
 from typing import Callable, Any, TYPE_CHECKING, NamedTuple
 from PyQt6.QtCore import pyqtSignal, QObject, pyqtSlot, QRunnable, QThreadPool, Qt
@@ -23,9 +23,8 @@ from core.contracts import LeafHandler, ContainerHandler
 from core.native.block_device import BlockDevice
 if TYPE_CHECKING:
     from core.node import VfsNode, ModTracker
-    from core.contracts import BaseHandler, PhysicalHandler
-    from core.handlers.iso_container import IsoHandler
-    from core.handlers.kods_container import KodsHandler
+    from core.contracts import BaseHandler, PhysicalHandler, SourceRebuildFlags
+    from core.handlers.iso_container import SourceHandler
     from core.navigator import VfsNavigator
     from core.dispatcher import Dispatcher
 
@@ -48,19 +47,6 @@ class LogChannel(Enum):
     REBUILD = auto()
     TOAST   = auto()
     ACTION  = auto()
-
-class IsoRebuildFlags(Flag):
-    '''
-    Which patches need to be applied to the filesystems before or during the ISO rebuild.
-    Patches should be designed as independent and combinable.
-    Adding a new patch should be as simple as adding a new flag and logic(Navigation + Overwrite).
-
-    SLIMMED           - IsoHandler, patch out non-essential runtime data to save 1GB
-    CUTSCENE_SKIPPER  - EvdHandler, scan and patch all story events with the appropriate near instant termination
-    '''
-    NONE              = 0
-    SLIMMED           = auto()
-    CUTSCENE_SKIPPER  = auto()
 
 class ActionType(Enum):
     '''
@@ -109,9 +95,9 @@ class EditorPayload:
     data: Any
 
 class LoadIsoResult(NamedTuple):
-    '''Payload for _on_iso_loaded. PhysicalHandler and ISO handling are always dedicated logically.'''
+    '''Payload for _on_source_loaded. PhysicalHandler and ISO handling are always dedicated logically.'''
     success: bool
-    handler: IsoHandler | None = None
+    handler: SourceHandler | None = None
     root:    VfsNode         | None = None
     error:   str             | None = None
 
@@ -425,12 +411,6 @@ class TaskHandle(QObject):
             self._transition('failed')
             self.finished.emit(False, str(error))
 
-###-------------------------------------- Rebuild Patches ------------------------------------###
-
-REBUILD_PATCH_ACTIONS: dict[IsoRebuildFlags, str] = {
-    IsoRebuildFlags.CUTSCENE_SKIPPER: 'Skip cutscenes',
-}
-
 ###---------------------------------------- Actions --------------------------------------###
 
 class Actions:
@@ -486,7 +466,7 @@ class Actions:
         should be adjusted if reimplemented in the future.
         '''
         result = navigator.rollup_nodes(nodes, task_handle)
-        if 0 < len(result) > 2:  # rollup on a single virtual mutation should never result in more than a physical node + datacenter rebuild
+        if 0 < len(result) > 2:  # rollup on a single virtual mutation should never result in more than a physical node + package member rebuild
             return False
         task_handle.checkpoint()
         return True
@@ -510,14 +490,7 @@ class Actions:
         if not raw_bytes:
             raise ValueError(f'unwrap_chain returned empty bytes for "{node.name}"')
         task_handle.checkpoint()
-        header_bytes = navigator.resolve_data_from_hid(node.target)
-        if not issubclass(handler_class, (ContainerHandler, LeafHandler)):
-            raise TypeError(
-                f'{handler_class.__name__} must be ContainerHandler or LeafHandler.'
-            )
-        with handler_class(raw_bytes, node.parent) as handler:
-            handler.task_handle = task_handle
-            handler.datacenter_header = header_bytes
+        with navigator.open_handler(handler_class, node, task_handle, raw_bytes) as handler:
             result = handler.prepare_editor_data(node, raw_bytes)
         logger.debug(f'prepare_editor: {node.name} -> {type(result).__name__} from {handler_class.__name__}')
         return EditorPayload(node=node, data=result)
@@ -549,7 +522,6 @@ class Actions:
     def fetch_for_editor(
         hid: tuple[int, ...],
         navigator: VfsNavigator,
-        expansion_callback: Callable[[VfsNode, threading.Event], None],
         task_handle: TaskHandle
     ) -> EditorPayload:
         '''
@@ -567,21 +539,7 @@ class Actions:
         if not handler_class:
             raise ValueError(f'No handler registered for node: {node}')
         task_handle.checkpoint()
-        # Datacenter verification
-        header_bytes = None
-        if hasattr(node, 'target') and node.target:
-            header_bytes = navigator.resolve_data_from_hid(node.target)
-            if not header_bytes:
-                raise ValueError(f'Could not resolve header bytes for target: {node.target}. Ensure it exists.')
-        if not issubclass(handler_class, (ContainerHandler, LeafHandler)):
-            raise TypeError(
-                f'{handler_class.__name__} must be ContainerHandler or LeafHandler'
-            )
-        # Start prepare_editor_data and return the EditorPayload
-        with handler_class(raw_bytes, node.parent) as handler:
-            handler.tesk_handle = task_handle
-            if header_bytes:
-                handler.datacenter_header = header_bytes
+        with navigator.open_handler(handler_class, node, task_handle, raw_bytes) as handler:
             result = handler.prepare_editor_data(node, raw_bytes)
         logger.debug(f'fetch_for_editor: {hid} -> {type(result).__name__} from {handler_class.__name__}')
         return EditorPayload(node=node, data=result)
@@ -664,8 +622,8 @@ class Actions:
 
     ### ISO Specific actions
     @staticmethod
-    def load_iso(
-        handler:       IsoHandler,
+    def load_source(
+        handler:       SourceHandler,
         task_handle:   TaskHandle,
     ) -> object:
         '''Read the TOC and split the disk into it's physical files'''
@@ -677,12 +635,12 @@ class Actions:
 
     @staticmethod
     def rebuild_iso(
-        handler:       IsoHandler,
+        handler:       SourceHandler,
         root_node:     VfsNode,
         navigator:     VfsNavigator,
         staged_nodes:  list[VfsNode],
         output_path:   Path,
-        build_flags:   IsoRebuildFlags,
+        build_flags:   SourceRebuildFlags,
         patch_targets: dict[str, list[VfsNode]],
         task_handle:  TaskHandle,
     ) -> ActionResult:
@@ -690,10 +648,11 @@ class Actions:
         try:
             task_handle.log_message.emit('Starting ISO build sequence...')
             task_handle.progress.emit(0)
-            if build_flags is not IsoRebuildFlags.NONE:
+            if build_flags:
+                flags_cls = type(build_flags)
                 applied = ', '.join(
-                    flag.name for flag in IsoRebuildFlags
-                    if flag is not IsoRebuildFlags.NONE and (build_flags & flag) and flag.name
+                    flag.name for flag in flags_cls
+                    if flag.value and (build_flags & flag) and flag.name is not None
                 )
                 task_handle.log_message.emit(f'Patch(es) to be applied: {applied}')
             task_handle.log_message.emit('Starting Pass 0   -   Applying patches...')
@@ -701,11 +660,11 @@ class Actions:
             if patched_nodes :
                 staged_nodes = list(staged_nodes) + patched_nodes
                 task_handle.log_message.emit(f'Pass 0 complete   -   Patched {len(patched_nodes)} nodes')
-            task_handle.log_message.emit('Starting Pass 1   -   Precomputing Datacenter...')
+            task_handle.log_message.emit('Starting Pass 1   -   Precomputing Packages...')
 
-            extra_targets: list[VfsNode] = navigator.precompute_datacenter(staged_nodes, task_handle)
+            extra_targets: list[VfsNode] = navigator.precompute_packages(staged_nodes, task_handle)
             all_staged:    list[VfsNode] = list(staged_nodes) + extra_targets
-            task_handle.log_message.emit(f'Pass 1 complete   -   {len(extra_targets)} datacenter target(s) cached and queued')
+            task_handle.log_message.emit(f'Pass 1 complete   -   {len(extra_targets)} package member(s) cached and queued')
 
             task_handle.progress.emit(0)
             task_handle.log_message.emit('Starting Pass 2   -   Performing VFS rollup...')
@@ -745,13 +704,13 @@ class Actions:
             )
 
     @staticmethod
-    def verify_iso(
-        handler:      IsoHandler,
+    def verify_source(
+        handler:      SourceHandler,
         task_handle:  TaskHandle,
     ) -> str:
         task_handle.progress.emit(0)
         task_handle.log_message.emit('Verifying ISO...')
-        result = handler.verify_iso_integrity(task_handle)
+        result = handler.verify_source_integrity(task_handle)
         task_handle.log_message.emit(f'ISO verified {result}')
         task_handle.progress.emit(100)
         return result
@@ -818,52 +777,51 @@ class Actions:
             )
 
     @staticmethod
-    def complex_import(
+    def package_import(
         node:          VfsNode,
-        target_node:   VfsNode,
-        handler_class: type[KodsHandler],
+        handler_class: type[BaseHandler],
+        navigator:     VfsNavigator,
         tracker:       ModTracker,
         resolver:      Callable[[VfsNode], bytes],
-        inner_nodes:   list[VfsNode],
         file_path:     Path,
         task_handle:   TaskHandle,
     ) -> ActionResult:
         '''
-        Import a new raw payload for a datacenter node. This means that the Kods imported is actually
-        missing it's header.
-
-        In the future depending on how we end up resolving these imports we should add some dialog or
-        checks to see if the datacenter header can be or is uploaded.
+        Import a new raw payload for a node whose handler depends on package members.
+        Computing both the node and it's linked nodes.
         '''
         try:
-            task_handle.log_message.emit(f'Importing {file_path.name} as datacenter file...')
-            # Build the new headers for the payload
-            new_payload = file_path.read_bytes()
+            task_handle.log_message.emit(f'Importing {file_path.name} as a package...')
+            new_payload  = file_path.read_bytes()
             orig_payload = resolver(node)
-            orig_header = resolver(target_node)
-            child_headers = {(node.hierarchical_id[-1] % 10) - 1: resolver(node) for node in inner_nodes if node.size > 8}
             if not node.parent:
-                raise ValueError(f'No parent for node {node}')
-            with handler_class(orig_payload, node.parent) as handler:
-                new_header_outer, new_headers_inner = handler.complex_import(node, orig_header, new_payload, child_headers)
+                raise ValueError(f'No parent for {node}, can\'t open handler.')
+            with navigator.open_handler(handler_class, node, task_handle, orig_payload) as handler:
+                package = handler.package
+                if package is None:
+                    raise ValueError(f'{node} has no package to import against')
+                result = handler.import_payload(node, new_payload, package)
             task_handle.checkpoint()
-            # Apply the computed headers to the appropriate nodes
-            tracker.mark_modified(node, new_payload, orig_payload)
-            tracker.mark_modified(target_node, new_header_outer, orig_header)
-            for inner_node in inner_nodes:
-                slot_index = (inner_node.hierarchical_id[-1] % 10) - 1
-                if slot_index in new_headers_inner:
-                    tracker.mark_modified(inner_node, new_headers_inner[slot_index], resolver(inner_node))
+            # Apply the payload and the updated members
+            changes = [(node, result.payload)]
+            originals = {node: orig_payload}
+            for role, data in (result.companions or {}).items():
+                member = package.members.get(role)
+                if member is None:
+                    raise ValueError(f'Handler returned package member {role} which the package does not contain')
+                changes.append((member, data))
+                originals[member] = package.data[role]
+            tracker.apply_group(changes, lambda n: originals[n])
             return ActionResult(
-                action_name='Complex Import',
+                action_name='Package Import',
                 node=node,
                 status=ActionStatus.SUCCESS,
-                payload=new_payload
+                payload=result.payload
             )
         except Exception as e:
-            logger.error(f'Complex Import failed: {e}', exc_info=True)
+            logger.error(f'Package Import failed: {e}', exc_info=True)
             return ActionResult(
-                action_name='Complex Import',
+                action_name='Package Import',
                 node=node,
                 status=ActionStatus.FAILURE,
                 message=str(e),
@@ -888,13 +846,8 @@ class Actions:
         if action_name != 'Properties':
             task_handle.log_message.emit(f'Starting "{action_name}" on node: {node}...')
         try:
-            node_bytes   = navigator.unwrap_chain(node)
-            header_bytes = navigator.resolve_data_from_hid(node.target)
-            if not issubclass(handler_class, (ContainerHandler, LeafHandler)):
-                raise TypeError(f'{handler_class.__name__} must be ContainerHandler or LeafHandler.')
-            with handler_class(node_bytes, node.parent) as handler:
-                handler.task_handle = task_handle
-                setattr(handler, 'datacenter_header', header_bytes)
+            node_bytes = navigator.unwrap_chain(node)
+            with navigator.open_handler(handler_class, node, task_handle, node_bytes) as handler:
                 payload = handler.execute_action(node, action_name, **kwargs)
             if action_name != 'Properties':
                 task_handle.log_message.emit(f'Finished "{action_name}" on node: {node}.')

@@ -1,8 +1,9 @@
 '''
-Registry; the global lookup for all handlers and editors, and their purposes.
+Registry; the global lookup for all handlers, editors, and sources.
 Registration happens at startup catching errors before runtime and locks preventing runtime mutations.
 
 HandlerProfile, EditorProfile are created for @Registry.register, @Registry.register_editor respectively.
+SourceProfiles are created for @Registry.register_source.
 FormatResolver features the lookup API
 
 The registry supports multiple handlers or editors for the same category/extension. However the current codebase uses
@@ -14,14 +15,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from pathlib import Path
-from core.contracts import BaseEditor, BaseHandler
 from core.workers import ActionDef, ActionType
-
+from core.contracts import BaseSource, BaseEditor, BaseHandler
 from core.handlers import discover_handlers
 from ui.editors import discover_editors
+from core.sources import discover_sources
 
 if TYPE_CHECKING:
     from core.node import VfsNode
+    from core.native.block_device import BlockDevice
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -46,6 +48,8 @@ class FormatResolver(Protocol):
     def get_editors(self, node: 'VfsNode') -> 'list[type[BaseHandler]]': ...
     def get_action(self, node: 'VfsNode', action_name: str) -> 'ActionDef | None': ...
     def get_handler_for_editor(self, editor: 'type[BaseEditor]') -> 'type[BaseHandler] | None': ...
+    def get_source(self, source_id: str) -> 'BaseSource': ...
+    def detect_source(self, handle: 'BlockDevice') -> 'BaseSource': ...
 
 ###---------------------------------------- Format Profiles ------------------------------------------------###
 
@@ -93,6 +97,7 @@ class Registry:
     Central format service locator. Supports two kinds of resolutions.
     Node resolution      get_profile(node) / get_handler(node)
     Editor resolution    get_handler_for_editor(editor)
+    Source resolution    get_source(source_id) / detect_source(handle)
     '''
     _handler_profiles: list[HandlerProfile] = []
     _editor_profiles:  list[EditorProfile] = []
@@ -101,7 +106,8 @@ class Registry:
     _editor_by_ext:    dict[str, list[EditorProfile]] = {}
     _editor_by_cat:    dict[str, list[EditorProfile]] = {}
     _global_editors:   list[EditorProfile] = []
-    _locked:       bool = False
+    _sources:          dict[str, BaseSource] = {}
+    _locked:           bool = False
 
     @classmethod
     def lock(cls) -> None:
@@ -118,9 +124,9 @@ class Registry:
                 )
         logger.info(
             f'Locked -- {len(cls._handler_profiles)} handler(s), {len(cls._editor_profiles)} editor(s)'
-            f'{len(cls._global_editors)} global editor(s)'
+            f'{len(cls._global_editors)} global editor(s), {len(cls._sources)} source(s)'
         )
-        logger.debug(cls.summary())
+        print(cls.summary())
 
     @classmethod
     def reset(cls) -> None:
@@ -132,6 +138,7 @@ class Registry:
         cls._editor_by_ext.clear()
         cls._editor_by_cat.clear()
         cls._global_editors.clear()
+        cls._sources.clear()
         cls._locked = False
 
     ###----------------------------------- register ------------------------------------------###
@@ -236,6 +243,24 @@ class Registry:
             return cls_or_func
         return decorator
 
+    @classmethod
+    def register_source(cls, source_cls: type[BaseSource]) -> type[BaseSource]:
+        '''
+        Decorator for BaseSource subclasses. Validates the definition, then keeps one instance.
+        Errors surface here, at startup, naming the missing attribute or abstract method.
+        '''
+        if cls._locked:
+            raise RuntimeError(
+                f'Locked - Cannot register "{getattr(source_cls, "__name__", source_cls)}" after discover_all() '
+                f'has completed. Ensure all plugins are imported inside discover_all()'
+            )
+        if not (isinstance(source_cls, type) and issubclass(source_cls, BaseSource)):
+            raise TypeError(f'@Registry.register_source is for BaseSource subclasses only, got {source_cls!r}.')
+        source_cls.validate_definition()
+        if source_cls.display_name in cls._sources:
+            raise ValueError(f'Source {source_cls.display_name!r} is already registered')
+        cls._sources[source_cls.display_name] = source_cls()
+        return source_cls
 
     ###------------------------------- Lookups ----------------------------------###
     @classmethod
@@ -278,7 +303,7 @@ class Registry:
     def get_handler(cls, source: VfsNode | Path) -> type[BaseHandler] | None:
         '''
         Return the first matching handler for the source.
-        Performs platform-specific checks for physical drives to force IsoHandler.
+        Performs platform-specific checks for physical drives to force SourceHandler.
         '''
         if isinstance(source, Path):
             import platform
@@ -292,7 +317,7 @@ class Registry:
                 except OSError:
                     pass  # Permissions errors are logged to the ui or features should be already disabled
             if is_physical_drive:
-                # Force IsoHandler for physical drives
+                # Force SourceHandler for physical drives
                 p = cls._handler_by_ext.get('.iso')
                 return p[0].handler_class if p else None
             if source.is_file():
@@ -357,6 +382,25 @@ class Registry:
                 return action
         return _GLOBAL_ACTIONS_BY_NAME.get(action_name, None)
 
+    @classmethod
+    def get_source(cls, source_id: str) -> BaseSource:
+        try:
+            return cls._sources[source_id]
+        except KeyError:
+            raise ValueError(f'unknown source {source_id!r}. Available: {sorted(cls._sources)} from None')
+
+    @classmethod
+    def list_sources(cls) -> list[BaseSource]:
+        return list(cls._sources.values())
+
+    @classmethod
+    def detect_source(cls, handle: BlockDevice) -> BaseSource:
+        '''Return the registered source whose signature matches'''
+        for source in cls._sources.values():
+            if source.matches(handle):
+                return source
+        raise ValueError('No registered source matched this disk.')
+
     ###----------------------------------- Diagnostics ---------------------------------------###
     @classmethod
     def summary(cls) -> str:
@@ -374,6 +418,12 @@ class Registry:
             lines.append(
                 f'    {p.name!r:40s} - {p.editor_class.__name__:30s} handler={p.handler_class.__name__} '
                 f'ext={p.extensions} role={p.editor_class!r}{fallback}'
+            )
+        lines.append(f'  Sources ({len(cls._sources)}):')
+        for source in cls._sources.values():
+            lines.append(
+                f'    {source.display_name!r:30s} - {source.display_name:30s} sector_size={source.geometry.sector_size:#x} '
+                f'builder={source.builder.__name__ if source.builder else "None"} patches=[{", ".join(p.name for p in source.patches)}]'
             )
         return '\n'.join(lines)
 
@@ -407,7 +457,8 @@ def discover_all() -> None:
     '''
     handler_errors = discover_handlers(Registry)
     editor_errors = discover_editors(Registry)
-    all_errors = handler_errors + editor_errors
+    source_errors = discover_sources(Registry)
+    all_errors = handler_errors + editor_errors + source_errors
 
     if all_errors:
         import traceback

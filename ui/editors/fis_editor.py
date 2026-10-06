@@ -7,9 +7,9 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal, QPoint, QTimer, QObject
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton, QScrollArea, QSizePolicy,
     QFrame, QFileDialog, QListWidget, QListView, QAbstractItemView, QListWidgetItem, QColorDialog,
-    QSlider, QButtonGroup
+    QSlider, QButtonGroup, QStackedLayout, QStackedWidget
 )
-from PyQt6.QtGui import QPixmap, QImage, QColor, QIcon, QTransform
+from PyQt6.QtGui import QPixmap, QImage, QColor, QIcon, QTransform, qRgb, qRed, qGreen, qBlue, qAlpha
 
 from core.contracts import BaseEditor
 from core.registry import Registry
@@ -104,6 +104,7 @@ class InteractiveCanvas(QLabel):
         self.image_ref: QImage | None = None
         self.zoom_factor:       float = 1.0
         self.selected_color_idx:  int = -1
+        self.selected_color:      QColor = QColor(255, 0, 0, 255)
         self.current_tool:        str = 'brush'
         self.brush_size:          int = 1
 
@@ -143,8 +144,12 @@ class InteractiveCanvas(QLabel):
         super().mouseMoveEvent(event)
 
     def _paint_pixel(self, pos: QPoint) -> None:
-        if not self.image_ref or self.selected_color_idx < 0:
+        if not self.image_ref:
             return
+        is_indexed = (self.image_ref.format() == QImage.Format.Format_Indexed8)
+        if is_indexed and self.selected_color_idx < 0:
+            return
+
         x = int(pos.x() / self.zoom_factor)
         y = int(pos.y() / self.zoom_factor)
         w, h = self.image_ref.width(), self.image_ref.height()
@@ -153,13 +158,20 @@ class InteractiveCanvas(QLabel):
         start_offset = -(self.brush_size // 2) if self.brush_size != 1 else 0
         end_offset   = start_offset + self.brush_size if self.brush_size != 1 else 1
 
+        target_rgba = self.selected_color.rgba()
+
         for dx in range(start_offset, end_offset):
             for dy in range(start_offset, end_offset):
                 nx, ny = x + dx, y + dy # apply scale factor to coord
                 if 0 <= nx < w and 0 <= ny < h:
-                    if self.image_ref.pixelIndex(nx, ny) != self.selected_color_idx:
-                        self.image_ref.setPixel(nx, ny, self.selected_color_idx)
-                        changed = True
+                    if is_indexed:
+                        if self.image_ref.pixelIndex(nx, ny) != self.selected_color_idx:
+                            self.image_ref.setPixel(nx, ny, self.selected_color_idx)
+                            changed = True
+                    else:
+                        if self.image_ref.pixel(nx, ny) != target_rgba:
+                            self.image_ref.setPixel(nx, ny, target_rgba)
+                            changed = True
         if changed:
             self.update_display()
             self.painted.emit()
@@ -168,25 +180,43 @@ class InteractiveCanvas(QLabel):
         '''Flood fill enforced by palette index'''
         if not self.image_ref or self.selected_color_idx < 0:
             return
+        is_indexed = (self.image_ref.format() == QImage.Format.Format_Indexed8)
+        if is_indexed and self.selected_color_idx < 0:
+            return
+
         x = int(pos.x() / self.zoom_factor)
         y = int(pos.y() / self.zoom_factor)
         w, h = self.image_ref.width(), self.image_ref.height()
         if not (0 <= x < w and 0 <= y < h):
             return
-        target_idx = self.image_ref.pixelIndex(x, y)
-        if target_idx == self.selected_color_idx:
-            return
+        if is_indexed:
+            target_val = self.image_ref.pixelIndex(x, y)
+
+            if target_val == self.selected_color_idx:
+                return
+            self.image_ref.setPixel(x, y, self.selected_color_idx)
+        else:
+            target_val = self.image_ref.pixel(x, y)
+            new_rgba = self.selected_color.rgba()
+            if target_val == new_rgba:
+                return
+            self.image_ref.setPixel(x, y, new_rgba)
 
         stack = [(x, y)]
-        self.image_ref.setPixel(x, y, self.selected_color_idx)
         while stack:
             cx, cy = stack.pop() # get temp central pos
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)): # check adjacent
                 nx, ny = cx + dx, cy + dy # adjacent pos calculation
                 if 0 <= nx < w and 0 <= ny < h:
-                    if self.image_ref.pixelIndex(nx, ny) == target_idx:
-                        self.image_ref.setPixel(nx, ny, self.selected_color_idx)
-                        stack.append((nx, ny))
+                    if is_indexed:
+                        if self.image_ref.pixelIndex(nx, ny) == target_val:
+                            self.image_ref.setPixel(nx, ny, self.selected_color_idx)
+                            stack.append((nx, ny))
+                    else:
+                        if self.image_ref.pixel(nx, ny) == target_val:
+                            self.image_ref.setPixel(nx, ny, self.selected_color.rgba())
+                            stack.append((nx, ny))
+
         self.update_display()
         self.painted.emit()
 
@@ -315,9 +345,13 @@ class FisEditorWidget(BaseEditor):
         lay.addLayout(size_row)
         lay.addSpacing(15)
 
+        self._color_stack = QStackedWidget()
 
+        clut_widget = QWidget()
+        clut_lay = QVBoxLayout(clut_widget)
+        clut_lay.setContentsMargins(0, 0, 0, 0)
         ### CLUT Section
-        lay.addWidget(QLabel('<b>Palette </b>*right click to edit'))
+        clut_lay.addWidget(QLabel('<b>Palette </b>*right click to edit'))
 
         self._palette_list = QListWidget()
         self._palette_list.setViewMode(QListView.ViewMode.IconMode)
@@ -330,8 +364,23 @@ class FisEditorWidget(BaseEditor):
         self._palette_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._palette_list.customContextMenuRequested.connect(self._on_palette_context)
 
-        lay.addWidget(self._palette_list, stretch=1)
+        clut_lay.addWidget(self._palette_list)
 
+        direct_widget = QWidget()
+        direct_lay = QVBoxLayout(direct_widget)
+        direct_lay.setContentsMargins(0, 0, 0, 0)
+        direct_lay.addWidget(QLabel('<b>Active Drawing Color</b>'))
+
+        self._btn_direct_color = QPushButton('Choose COlor...')
+        self._btn_direct_color.setFixedHeight(36)
+        self._btn_direct_color.clicked.connect(self._pick_direct_color)
+        direct_lay.addWidget(self._btn_direct_color)
+        direct_lay.addStretch()
+
+        self._color_stack.addWidget(clut_widget)
+        self._color_stack.addWidget(direct_widget)
+
+        lay.addWidget(self._color_stack, stretch=1)
         return frame
 
 ###----------------------------------- Contractuals ---------------------------------------------###
@@ -367,10 +416,15 @@ class FisEditorWidget(BaseEditor):
         if not self.img or not self.info or not self.current_node:
             return
         self.history.initialize(self.img)
-        self._populate_palette()
+        if self.img.format() == QImage.Format.Format_Indexed8:
+            self._color_stack.setCurrentIndex(0)
+            self._populate_palette()
+        else:
+            self._color_stack.setCurrentIndex(1)
+            self._update_direct_color_button(self._image_label.selected_color)
+
         self._display_image(self.img)
         self._populate_info(self.info)
-
         self._btn_export.setEnabled(True)
         logger.debug(f'FIS: loaded {self.current_node.name} ({self.info.width}×{self.info.height} {self.info.psm_name})')
 
@@ -428,7 +482,8 @@ class FisEditorWidget(BaseEditor):
         '''Undo action and sync states'''
         prev_img = self.history.undo()
         if prev_img and self.img:
-            clut_changed = self.img.colorTable() != prev_img.colorTable()
+            is_indexed = (self.img.format() == QImage.Format.Format_Indexed8)
+            clut_changed = is_indexed and (self.img.colorTable() != prev_img.colorTable())
             self.img = prev_img
             self._apply_zoom()
             if clut_changed:
@@ -438,7 +493,8 @@ class FisEditorWidget(BaseEditor):
     def redo(self) -> None:
         next_img = self.history.redo()
         if next_img and self.img:
-            clut_changed = self.img.colorTable() != next_img.colorTable()
+            is_indexed = (self.img.format() == QImage.Format.Format_Indexed8)
+            clut_changed = is_indexed and (self.img.colorTable() != next_img.colorTable())
             self.img = next_img
             self._apply_zoom()
             if clut_changed:
@@ -492,9 +548,26 @@ class FisEditorWidget(BaseEditor):
             self.history.push_change(self.img)
             self._update_dirty_state()
 
+    def _pick_direct_color(self) -> None:
+        new_color = QColorDialog.getColor(
+            initial=self._image_label.selected_color,
+            parent=self,
+            title='Select Direct Color',
+            options=QColorDialog.ColorDialogOption.ShowAlphaChannel | QColorDialog.ColorDialogOption.DontUseNativeDialog
+        )
+        if new_color.isValid():
+            self._image_label.selected_color = new_color
+            self._update_direct_color_button(new_color)
+
+    def _update_direct_color_button(self, color: QColor) -> None:
+        pix = QPixmap(20, 20)
+        pix.fill(color)
+        self._btn_direct_color.setIcon(QIcon(pix))
+        self._btn_direct_color.setText(f' {color.name().upper()} (A: {color.alpha()})')
+
     def _on_palette_context(self, pos: QPoint) -> None:
         item = self._palette_list.itemAt(pos)
-        if not item or not self.img:
+        if not item or not self.img or self.img.format() != QImage.Format.Format_Indexed8:
             return
         idx           = self._palette_list.row(item)
         current_color = QColor.fromRgba(self.img.color(idx))
@@ -502,7 +575,7 @@ class FisEditorWidget(BaseEditor):
             initial=current_color,
             parent=self,
             title=f'Overwrite CLUT Color [{idx}]',
-            options=QColorDialog.ColorDialogOption.DontUseNativeDialog
+            options=QColorDialog.ColorDialogOption.ShowAlphaChannel | QColorDialog.ColorDialogOption.DontUseNativeDialog
         )
         if new_color.isValid() and new_color != current_color:
             self.history.push_change(self.img)
@@ -554,7 +627,7 @@ class FisEditorWidget(BaseEditor):
     def _populate_palette(self) -> None:
         '''Extracts the Qimage color table (CLUT) stored from the handler'''
         self._palette_list.clear()
-        if not self.img:
+        if not self.img or self.img.format() != QImage.Format.Format_Indexed8:
             return
         colors = self.img.colorTable()
         for idx, rgb in enumerate(colors):
@@ -571,7 +644,7 @@ class FisEditorWidget(BaseEditor):
 
     def _update_palette_icons(self) -> None:
         '''Updates color icons in place'''
-        if not self.img:
+        if not self.img or self.img.format() != QImage.Format.Format_Indexed8:
             return
         for idx, rgb in enumerate(self.img.colorTable()):
             item = self._palette_list.item(idx)

@@ -51,7 +51,8 @@ from core.dispatcher import Dispatcher, RebuildCoordinator, LogChannel, Conflict
 from core.metadata_manager import NodeMetadataStore
 from core.node import VfsNode
 from core.version import __version__
-from core.workers import TaskHandle, IsoRebuildFlags
+from core.workers import TaskHandle
+from core.contracts import SourceRebuildFlags, BasePatch
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
 from PyQt6.QtGui import QAction, QCloseEvent, QColor, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
@@ -100,7 +101,7 @@ class MainWindow(QMainWindow):
         self._zoom_delta     = self.app_settings.zoom_delta
         # Setup metadata database
         self.metadata_store  = NodeMetadataStore(
-            get_resource_path('ui/assets/radi_metadata.json'),
+            get_resource_path('ui/assets/placeholder.json'),
             auto_save=True,
             parent=self,
         )
@@ -172,13 +173,13 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         """Routes main window state signals between UI pages or dispatcher"""
-        self.welcome_page.request_open.connect(self.attempt_load_iso)
+        self.welcome_page.request_open.connect(self.attempt_load_source)
         self.file_browser_page.btn_review.clicked.connect(lambda: self.stack.setCurrentIndex(AppPage.STAGING))
         self.staging_page.request_file_browser.connect(lambda: self.stack.setCurrentIndex(AppPage.FILEBROWSER))
         self.editor_page.back_requested.connect(lambda: self.stack.setCurrentIndex(AppPage.FILEBROWSER))
 
-        self.dispatcher.iso_loaded.connect(self._on_iso_loaded)
-        self.dispatcher.iso_verified.connect(lambda build: self.status_bar.showMessage(build))
+        self.dispatcher.source_loaded.connect(self._on_source_loaded)
+        self.dispatcher.source_verified.connect(lambda build: self.status_bar.showMessage(build))
 
         self.rebuild_coordinator.preparing_build.connect(self._on_rebuild_prep_started)
         self.rebuild_coordinator.started.connect(self._on_rebuild_started)
@@ -260,10 +261,11 @@ class MainWindow(QMainWindow):
         self.menu_manager.close_action.setEnabled(has_iso)
         self.menu_manager.verify_hash.setEnabled(has_iso)
         self.menu_manager.apply_patches.setEnabled(has_iso)
+        self.menu_manager.refresh_patches_menu()
 
     ###----------------------------------- ISO ----------------------------------###
 
-    def attempt_load_iso(self, path: Path) -> None:
+    def attempt_load_source(self, path: Path) -> None:
         """
         Prompt the user for an ISO and pass the path to the dispatcher.
         ISO processing happens on a background thread.
@@ -277,6 +279,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'Load Error', f'No handler for {path.name}')
             self.welcome_page.set_loading(False)
             return
+        self._reload_metadata_for_source()
         task_handle.log_message.connect(self._on_worker_log)
 
     def _on_rebuild_prep_started(self) -> None:
@@ -298,7 +301,7 @@ class MainWindow(QMainWindow):
         self.rebuild_page.header.setText('Rebuilding ISO...')
         self.rebuild_page.set_task_handle(handle)
 
-    def _on_iso_loaded(self, success: bool, result: VfsNode | str) -> None:
+    def _on_source_loaded(self, success: bool, result: VfsNode | str) -> None:
         self.welcome_page.set_loading(False)
         if not success:
             msg = f'Failed to load ISO:\n{result}'
@@ -307,12 +310,26 @@ class MainWindow(QMainWindow):
             self.status_bar.clearMessage()
             return
         has_iso = isinstance(result, VfsNode)
-        if not has_iso:
+        if not has_iso or not self.dispatcher or not self.dispatcher.vfs:
             return
+        self.dispatcher.vfs.enrich_initial_tree() # Populates node names/categories/extensions from metadata
         self.controller.init_file_tree(result)
         self.stack.setCurrentIndex(AppPage.FILEBROWSER)
         self.file_browser_page.setFocus()
         self._toggle_menu_actions(has_iso)
+
+    def _reload_metadata_for_source(self) -> None:
+        handler = getattr(self.dispatcher, 'active_handler', None)
+        source = getattr(handler, 'source', None)
+        metadata_path = getattr(source, 'metadata_path', None)
+        if source is None or metadata_path is None:
+            return
+        resolved = get_resource_path(metadata_path)
+        if not resolved.is_file():
+            logger.info(f'{metadata_path} not found. Building metadata from scratch if possible...')
+            source.build_metadata(self.metadata_store)
+            return
+        self.metadata_store.reload(resolved)
 
     def on_rebuild_complete(self, success: bool, message: str) -> None:
         """Handles the completion signal from the background thread"""
@@ -758,28 +775,39 @@ class MainMenuBar:
         The reason being UX: QActions collapse the parent QMenu.
         "Apply patches" uses the standard QAction to close the menu when start the patching process.
 
-        Each checkbox is tied to a IsoRebuildFlags flag
+        Each checkbox is tied to a SourceRebuildFlags flag
         '''
-        patches_menu = self.menu_bar.addMenu('Patches')
-        assert patches_menu is not None
+        self.patches_menu = self.menu_bar.addMenu('Patches')
+        assert self.patches_menu is not None
 
-        self._patch_flags: list[tuple[QCheckBox, IsoRebuildFlags]] = []
-        def add_patch_box(title: str, tooltip: str, flag: IsoRebuildFlags) -> None:
-            action = QWidgetAction(patches_menu)
-            checkbox = QCheckBox(title, self.window)
-            checkbox.setToolTip(tooltip)
-            action.setDefaultWidget(checkbox)
-            patches_menu.addAction(action)
-            self._patch_flags.append((checkbox, flag))
-
-        add_patch_box('Slimmed rebuild', 'Save 1GB by trimming out unused disk space.', IsoRebuildFlags.SLIMMED)
-        add_patch_box('Cutscene skipper', 'Patch all story scripts to complete ASAP.', IsoRebuildFlags.CUTSCENE_SKIPPER)
-
-        patches_menu.addSeparator()
+        self._patch_flags: list[tuple[QCheckBox, SourceRebuildFlags]] = []
+        self._patch_actions: list[QWidgetAction] = []
+        self._patches_fotter_separator = self.patches_menu.addSeparator()
         self.apply_patches = QAction('Apply patches', self.window)
         self.apply_patches.setEnabled(False)
         self.apply_patches.triggered.connect(self._handle_patches)
-        patches_menu.addAction(self.apply_patches)
+        self.patches_menu.addAction(self.apply_patches)
+
+        self.refresh_patches_menu()
+
+    def refresh_patches_menu(self) -> None:
+        '''Refreshes the patches menu with the current source's patch options.'''
+        assert self.patches_menu is not None
+        for action in self._patch_actions:
+            self.patches_menu.removeAction(action)
+        self._patch_actions.clear()
+        self._patch_flags.clear()
+
+        options: tuple[BasePatch, ...] = self.dispatcher.get_patch_options()
+
+        for option in options:
+            action = QWidgetAction(self.patches_menu)
+            checkbox = QCheckBox(option.name, self.window)
+            checkbox.setToolTip(option.description)
+            action.setDefaultWidget(checkbox)
+            self.patches_menu.insertAction(self._patches_fotter_separator, action)
+            self._patch_actions.append(action)
+            self._patch_flags.append((checkbox, option.flag))
 
     def _build_info_menu(self) -> None:
         info_menu = self.menu_bar.addMenu('Info')
@@ -813,7 +841,7 @@ class MainMenuBar:
         )
         if path:
             self.settings.last_iso_dir = str(Path(path).parent)
-            self.window.attempt_load_iso(Path(path))
+            self.window.attempt_load_source(Path(path))
 
     def _handle_close(self) -> None:
         self.dispatcher.close()
@@ -854,10 +882,12 @@ class MainMenuBar:
 
     def _handle_patches(self) -> None:
         '''Trigger a rebuild of the unmodified source with the checked flags'''
-        build_flags = IsoRebuildFlags.NONE
-        for checkbox, flag in self._patch_flags:
-            if checkbox.isChecked():
-                build_flags |= flag
+        build_flags = self.dispatcher.compose_build_flags(
+            flag for checkbox, flag in self._patch_flags if checkbox.isChecked()
+        )
+        if build_flags is None:
+            logger.error('Cannot compose build flags: no source is loaded')
+            return
         self.window.rebuild_coordinator.request_rebuild([], build_flags=build_flags)
 
     def _handle_legend(self) -> None:

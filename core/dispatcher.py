@@ -5,17 +5,12 @@ Functions as a signal proxy
 from __future__ import annotations
 
 import functools
-import tempfile
 import threading
 import platform
-import subprocess
-import uuid
-import xxhash
 from enum import Enum, auto
-from struct import unpack_from
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtWidgets import QWidget, QFileDialog
 
@@ -23,15 +18,16 @@ from core.registry import Registry
 from core.node import VfsManager, ModTracker, VfsNode, NodeConflictError
 from core.workers import (
     TaskCoordinator, ActionStatus, ActionResult, Actions, ActionType, TaskHandle, LogChannel,
-    IsoRebuildFlags, ActionDef, EditorPayload
+    ActionDef, EditorPayload
 )
+from core.contracts import PackageIntent, BasePatch, BaseVirtualPatch
 from core.native.block_device import BlockDevice
 from core.navigator import VfsNavigator
 from core.metadata_manager import NodeMetadataStore
-from core.extension_overrides import lookup_extension
+
 if TYPE_CHECKING:
-    from core.contracts import BaseHandler, BaseEditor
-    from core.handlers.iso_container import IsoHandler
+    from core.contracts import BaseEditor, SourceRebuildFlags
+    from core.handlers.iso_container import SourceHandler
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -72,12 +68,13 @@ class Dispatcher(QObject):
     Dispatcher does not need to now what an action needs to execute.
     '''
     # Tree / Tracker
-    iso_loaded        = pyqtSignal(bool, object)      # (success, result[root | error_msg])
+    source_loaded        = pyqtSignal(bool, object)   # (success, result[root | error_msg])
+    source_closed        = pyqtSignal()               # Source torn down
     expand_requested  = pyqtSignal(VfsNode, object)   # (VfsNode, wait_event)
     tracking_update   = pyqtSignal(int, int)          # (modified_count, staged_count)
     conflict_prompt   = pyqtSignal(VfsNode, str, str) # (new_node, other node(s), reason)
     # ISO verification
-    iso_verified = pyqtSignal(str)                   # Build string. Used for get_build and verify_iso with the difference being specificity
+    source_verified = pyqtSignal(str)                   # Build string. Used for get_build and verify_source with the difference being specificity
     # Generic node actions
     action_complete  = pyqtSignal(ActionResult)      # ActionResult
     # Metadata inconsistencies
@@ -86,9 +83,9 @@ class Dispatcher(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._main_thread_id = threading.get_ident()
-        self.vfs:                    VfsManager | None = None
-        self.active_handler:         IsoHandler | None = None
-        self.nav:                  VfsNavigator | None = None
+        self.vfs:             VfsManager | None = None
+        self.active_handler:  SourceHandler | None = None
+        self.nav:             VfsNavigator | None = None
         self._metadata_store: NodeMetadataStore | None = None
         self.tracker          = ModTracker()
         self.task_coordinator = TaskCoordinator()
@@ -127,6 +124,28 @@ class Dispatcher(QObject):
         if success:
             self.tracker.clear()
 
+    def get_patch_options(self) -> tuple[BasePatch, ...]:
+        '''User-toggleable patch options for the active source.'''
+        if not self.active_handler:
+            return ()
+        return self.active_handler.source.patch_options
+
+    def rebuild_flags_class(self) -> type[SourceRebuildFlags] | None:
+        '''The flags class for the active source so callers can build a flag value without the source.'''
+        if not self.active_handler:
+            return None
+        return self.active_handler.source.rebuild_flags
+
+    def compose_build_flags(self, selected: Iterable[SourceRebuildFlags] =()) -> SourceRebuildFlags | None:
+        '''Combine the selected patch flags into one build flag value'''
+        flags_cls = self.rebuild_flags_class()
+        if flags_cls is None:
+            return None
+        flags = flags_cls(0)
+        for flag in selected:
+            flags |= flag
+        return flags
+
     def set_metadata_store(self, store: NodeMetadataStore) -> None:
         self._metadata_store = store
 
@@ -144,11 +163,11 @@ class Dispatcher(QObject):
         if isinstance(source, Path):
             handler_class = Registry.get_handler(source)
             from core.contracts import PhysicalHandler
-            from core.handlers.iso_container import IsoHandler
+            from core.handlers.iso_container import SourceHandler
             if (
                 not handler_class or
                 not (isinstance(handler_class, type) and issubclass(handler_class, PhysicalHandler)) or
-                not (isinstance(handler_class, type) and issubclass(handler_class, IsoHandler))
+                not (isinstance(handler_class, type) and issubclass(handler_class, SourceHandler))
             ):
                 logger.warning(f'No handler for {source.name}, {handler_class}')
                 return
@@ -328,8 +347,8 @@ class Dispatcher(QObject):
             self.nav.request_expansion(node, lambda success, _node: None)
             return
 
-        if action_def.action_type is ActionType.IMPORT and node.target:
-            self._execute_complex_import(node, action_def, **kwargs)
+        if action_def.action_type is ActionType.IMPORT and self.nav and self.nav.package_members(node, PackageIntent.IMPORT):
+            self._execute_package_import(node, action_def, **kwargs)
             return
 
         # Standard Action
@@ -341,51 +360,29 @@ class Dispatcher(QObject):
             channel=LogChannel.TOAST if action_def.action_type is ActionType.EXPORT else None,
             label=action_def.name,
             **kwargs
-            )
+        )
         task_handle.finished.connect(self._on_action_complete)
 
-    def _execute_complex_import(self, node: VfsNode, action_def: ActionDef, **kwargs) -> None:
-        '''Complex import helper: resolves unresolved nodes needed for import and start the worker.'''
-        if self.vfs is None or not node.target:
+    def _execute_package_import(self, node: VfsNode, action_def: ActionDef, **kwargs) -> None:
+        '''Package import helper: resolves unresolved nodes needed for import and start the worker.'''
+        if self.vfs is None or not node.target or not self.nav:
             return
         self.vfs.remove_node_children(node)
         handler_class = Registry.get_handler(node)
-        def _start_import(target_node: VfsNode) -> None:
-            if not self._metadata_store:
-                return
-            # check the metadata store to verify if we are dealing with an entity pack
-            base_idx = node.hierarchical_id_str
-            metadata = []
-            for i in range(10):
-                metadata.append(self._metadata_store.get(base_idx + '.' + str(i)))
-            child_headers = []
-            for entry in metadata:
-                if entry and entry.target_hid:
-                    child_headers.append(self.vfs.get_vfs_node_by_id(entry.target_hid)) # type: ignore The child always has to be previously registered at this point
+        def _start_import() -> None:
             task_handle = self._start(
-                Actions.complex_import,
+                Actions.package_import,
                 node,
-                target_node,
                 handler_class,
+                self.nav,
                 self.tracker,
                 self.get_node_data,
-                child_headers,
                 channel=LogChannel.TOAST,
                 label=action_def.name,
                 **kwargs
             )
             task_handle.finished.connect(self._on_action_complete)
-
-        target_node = self.vfs.get_vfs_node_by_id(node.target) if self.vfs else None
-        if target_node is not None:
-            _start_import(target_node)
-            return
-        if not self.nav:
-            logger.error(f'No navigator available to resolve {node.target} for {node}')
-            return
-        self.nav.resolve_ghost_node(node.target, _start_import)
-        return
-
+        self.nav.ensure_package(node, PackageIntent.IMPORT, _start_import)
 
     def start_iso_rebuild(self, request: RebuildRequest, output_path: Path) -> TaskHandle | None:
         '''
@@ -481,39 +478,27 @@ class Dispatcher(QObject):
         self.vfs            = None
         self.active_handler = None
         self.nav            = None
+        self.tracker.configure_source(None, None)
         self.tracker.clear()
         logger.debug('- File System Reset -')
+        self.source_closed.emit()
 
     ###------------------------------ Helpers --------------------------------###
 
-    def _load_physical(self, handler: IsoHandler) -> TaskHandle | None:
+    def _load_physical(self, handler: SourceHandler) -> TaskHandle | None:
         '''Send ISO loading to a worker thread'''
         if self.active_handler:
             self.active_handler.close()
+        self.active_handler = handler
         if not self._metadata_store:
             logger.debug(f'No file metadata loaded... {self._metadata_store}')
-
         task_handle = self._start(
-            Actions.load_iso,
+            Actions.load_source,
             handler,
             channel=LogChannel.BROWSER
         )
-        task_handle.finished.connect(self._on_iso_loaded)
+        task_handle.finished.connect(self._on_source_loaded)
         return task_handle
-
-    def _migrate_targets_if_needed(self) -> None:
-        store = self._metadata_store
-        if store is None:
-            return
-        has_targets = any(meta.target_hid is not None for meta in store._db.values())
-        if has_targets:
-            return
-        logger.info('No target entries found - running DatacenterTargets migration.')
-        count = store.ingest_datacenter_targets()
-        count += store.ingest_metadata()
-        store.save()
-        logger.info(f'Migration complete: {count} target entries written to {store._path.name}')
-        logger.info('Re-enrichment pass complete - datacenter nodes have .kods extension.')
 
     ###------------------------ Callbacks and Signals -----------------------###
     def _on_expand_requested(self, parent: VfsNode, wait_event: threading.Event) -> None:
@@ -589,47 +574,44 @@ class Dispatcher(QObject):
         '''
         if node.extension:
             return
+        if node.is_sentinel:
+            logger.debug(f'Skipping extension request, sentinel node has no bytes: {node}')
+            return
 
-        PK3_MAGIC = 0x004E000
-        def _check_pk(header: bytes) -> str:
-            '''Checks the header for pk3 pattern, filters out sentinel values.'''
-            check_1, check_2 = unpack_from('<II', header, 0x10)
-            if not check_1 or not check_2:
-                return '.bin'
-            if check_2 % PK3_MAGIC == 0 and check_1 % PK3_MAGIC == 0:  # header is pk3 divisible
-                return '.pk3'
-            return '.bin'
-
+        source_profile = getattr(self.active_handler, 'source_profile', None)
+        if not source_profile:
+            return
         header: bytes = self.get_node_data(node)[:0x30]
         if len(header.replace(b'\x00', b'')) < 16:
             logger.debug(f'Header too short: {len(header.replace(b"\\x00", b""))} bytes. {node} applying .bin')
-            ext = '.bin'
+            node.extension = '.bin'
         else:
-            ext = lookup_extension(header, _check_pk(header))
-        node.extension = ext
+            node.extension = self.active_handler.source.resolve_extension(node, header) if self.active_handler else '.bin'
         if auto_save and self._metadata_store is not None:
-            self._metadata_store.register(node.hierarchical_id_str, extension=ext)
-        logger.debug(f'Extension request fulfilled: {node.name} -> {ext}')
+            self._metadata_store.register(node.hierarchical_id_str, extension=node.extension)
+            logger.debug(f'Extension request saved: {node.hierarchical_id_str} -> {node.extension}')
 
-    def _on_iso_loaded(self, success: bool, result: object) -> None:
+    def _on_source_loaded(self, success: bool, result: object) -> None:
         '''Takes the ISO's root+children nodes and intializes:
         VfsManager -> VfsNavigator -> metadata -> and signals completion'''
         if threading.get_ident() != self._main_thread_id:
-            raise threading.ThreadError("_on_iso_loaded ran off the main thread")
+            raise threading.ThreadError("_on_source_loaded ran off the main thread")
+        if not self.active_handler:
+            raise RuntimeError('No active handler for the current source.')
         from core.workers import LoadIsoResult
         if not isinstance(result, LoadIsoResult) or not success:
             msg = result.error if isinstance(result, LoadIsoResult) else str(result)
-            self.iso_loaded.emit(False, msg)
+            self.source_loaded.emit(False, msg)
             return
         handler, root = result.handler, result.root
         if not root or not handler:
             msg = 'ISO load succeeded but no root or handler was returned'
-            self.iso_loaded.emit(False, msg)
+            self.source_loaded.emit(False, msg)
             return
 
-        self.active_handler = handler
         self.vfs = VfsManager(
             root,
+            self.active_handler.source.resolve_boundary(root),
             node_enricher=(self._metadata_store.enrich if self._metadata_store else None)
         )
         # Connect signals
@@ -637,15 +619,22 @@ class Dispatcher(QObject):
         self.tracker.node_reverted.connect(self.vfs.update_node)
         self.vfs.request_extension.connect(self._handle_extension_request)
 
-        self.vfs.enrich_initial_tree() # This populates node names/categories/extensions from metadata, thus is now crucial
-        self.nav = VfsNavigator(self.vfs, self.get_node_data, self._on_expand_requested, self._on_ghost_node_confirmed_missing)
+        self.nav = VfsNavigator(
+            self.vfs,
+            self.get_node_data,
+            self._on_expand_requested,
+            self._on_ghost_node_confirmed_missing,
+            self.active_handler.source,
+            links=self._metadata_store
+        )
+        self.tracker.configure_source(self.active_handler.source, self._metadata_store)
 
         if handler is not None:
             # I think doing this on mainthread is fine since when this fires it is not possible for there to be any node registration
             build = handler.get_region(root)
-            QTimer.singleShot(0, lambda: self.iso_verified.emit(build))
+            QTimer.singleShot(0, lambda: self.source_verified.emit(build))
         # self._migrate_targets_if_needed()   # Uncomment for building metadata from scratch
-        self.iso_loaded.emit(True, root)
+        self.source_loaded.emit(True, root)
 
     def _handle_verify_hash(self) -> None:
         '''
@@ -656,12 +645,12 @@ class Dispatcher(QObject):
         '''
         if self.active_handler is None:
             return
-        verify_handle = self._start(Actions.verify_iso, self.active_handler, label='Verify iso', channel=LogChannel.TOAST)
-        verify_handle.finished.connect(self._on_iso_verified)
+        verify_handle = self._start(Actions.verify_source, self.active_handler, label='Verify iso', channel=LogChannel.TOAST)
+        verify_handle.finished.connect(self._on_source_verified)
 
-    def _on_iso_verified(self, success: bool, result: Any) -> None:
+    def _on_source_verified(self, success: bool, result: Any) -> None:
         if success and isinstance(result, str):
-            self.iso_verified.emit(result)
+            self.source_verified.emit(result)
 
     def _on_action_complete(self, success: bool, result: Any) -> None:
         '''Result handler for Actions.dispatch tasks'''
@@ -773,25 +762,9 @@ def resolve_raw_disc_device(path: Path) -> Path | str:
 @dataclass(frozen=True)
 class RebuildRequest:
     '''Everything needed to determine the logic required for the ISO build.'''
-    staged_nodes: list[VfsNode]
-    build_flags:  IsoRebuildFlags = IsoRebuildFlags.NONE
+    staged_nodes:  list[VfsNode]
+    build_flags:   SourceRebuildFlags
     patch_targets: dict[str, list[VfsNode]] | None = None
-
-@dataclass(frozen=True)
-class PatchTargetRule:
-    '''
-    Links the patch flags to an action and target.
-    action is the ActionDef name to execute
-    parent_hid whose children are the targets to patch
-
-    A new patch must be added to RebuildFlag and PATCH_TARGET_RULES.
-    '''
-    action: str
-    parent_hid: tuple[int, ...]
-
-PATCH_TARGET_RULES: dict[IsoRebuildFlags, PatchTargetRule] = {
-    IsoRebuildFlags.CUTSCENE_SKIPPER: PatchTargetRule(action='Skip cutscenes', parent_hid=(186,)),
-}
 
 class RebuildCoordinator(QObject):
     '''
@@ -811,7 +784,7 @@ class RebuildCoordinator(QObject):
         self._parent = parent_widget # Connection for the File dialog
         self._config: RebuildRequest | None = None
 
-    def request_rebuild(self, staged_nodes: list[VfsNode], build_flags: IsoRebuildFlags = IsoRebuildFlags.NONE) -> None:
+    def request_rebuild(self, staged_nodes: list[VfsNode], build_flags: SourceRebuildFlags) -> None:
         '''
         Entry point for both the staging-page flow and direct triggers
         (e.g. the Patches menu). Resolves every active patch's targets
@@ -822,17 +795,19 @@ class RebuildCoordinator(QObject):
         self.preparing_build.emit()
         self._dispatcher.set_active_channel(LogChannel.REBUILD)
         self.log.emit('Preparing VFS for rebuild...')
-        active_rules = [
-            rule for flag, rule in PATCH_TARGET_RULES.items()
-            if flag is not IsoRebuildFlags.NONE and (build_flags & flag)
+        handler = self._dispatcher.active_handler
+        source = handler.source if handler else None
+        active_patches: list[BaseVirtualPatch] = [
+            patch for patch in (source.patches_for(build_flags) if source else [])
+            if isinstance(patch, BaseVirtualPatch)
         ]
-        self._resolve_patch_targets(staged_nodes, build_flags, active_rules, {})
+        self._resolve_patch_targets(staged_nodes, build_flags, active_patches, {})
 
     def _resolve_patch_targets(
         self,
         staged_nodes:  list[VfsNode],
-        build_flags:   IsoRebuildFlags,
-        rules:         list[PatchTargetRule],
+        build_flags:   SourceRebuildFlags,
+        patches:       list[BaseVirtualPatch],
         patch_targets: dict[str, list[VfsNode]],
     ) -> None:
         '''
@@ -843,26 +818,25 @@ class RebuildCoordinator(QObject):
 
         Current limitation: Forced recursive expansion, no targeted expansion yet.
         '''
-        if not rules or not self._dispatcher.vfs or not self._dispatcher.nav:
+        if not patches or not self._dispatcher.vfs or not self._dispatcher.nav:
             self._begin(staged_nodes, build_flags, patch_targets)
             return
 
-        rule, *rest = rules
+        patch, *rest = patches
 
         self.progress.emit(0)
-        self.log.emit(f'Resolving patch target for action: {rule.action}...')
+        self.log.emit(f'Resolving patch target for patch {patch.name}, action: {patch.action}...')
         def _on_resolved(leaves: list[VfsNode]) -> None:
             self.progress.emit(100)
-            self.log.emit(f'Successfully resolved {len(leaves)} nodes for action: {rule.action}')
-            patch_targets.setdefault(rule.action, []).extend(leaves)
+            patch_targets.setdefault(patch.action, []).extend(leaves)
+            self.log.emit(f'Successfully resolved {len(leaves)} nodes for patch {patch.name}, action: {patch.action}')
             self._resolve_patch_targets(staged_nodes, build_flags, rest, patch_targets)
-
-        self._dispatcher.resolve_and_unpack_all(rule.parent_hid, _on_resolved)
+        self._dispatcher.resolve_and_unpack_all(patch.hid, _on_resolved)
 
     def _begin(
         self,
         staged_nodes: list[VfsNode],
-        build_flags: IsoRebuildFlags,
+        build_flags: SourceRebuildFlags,
         patch_targets: dict[str, list[VfsNode]],
     ) -> None:
         self._config = RebuildRequest(staged_nodes, build_flags, patch_targets)

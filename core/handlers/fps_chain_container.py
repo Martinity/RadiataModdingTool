@@ -21,7 +21,7 @@ fps payload [28:32] offset to FIS payload + header size (0x40)
 '''
 @Registry.register(
     name='Chain Handler',
-    extensions=('.fps','.fas', '.rmac', '.tgil', '.xbdc', '.dnal', '.lctp', '.idom', '.ndnc'),
+    extensions=('.fps','.fas', '.rmac', '.tgil', '.xbdc', '.dnal', '.lctp', '.idom', '.ndnc', '.pcdc'),
     supported_actions=(
         ActionDef('Deconstruct Chain', ActionType.TREE_EXPAND),
         ActionDef('Properties', ActionType.DIALOG)

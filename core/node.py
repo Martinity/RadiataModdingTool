@@ -13,17 +13,18 @@ VfsManager (Relational data):
 
 ModTracker (Mutation tracking):
     Tracks modified nodes, staged rebuild queues, and original file backups.
-    Detects hierarchical and dependency conflicts among pending edits and manages
-    node reversion and staging state.
+    Detects hierarchical conflicts and delegates filesystem conflicts to the current source profile.
 '''
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import NamedTuple, Callable, TYPE_CHECKING, Iterator
+from typing import NamedTuple, Callable, TYPE_CHECKING, Iterator, Sequence
 from PyQt6.QtCore import pyqtSignal, QObject
 if TYPE_CHECKING:
     from core.handlers.compression_container import CompressorHandler
+    from core.contracts import BaseSource, LinkLookup
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -72,7 +73,7 @@ class VfsNode:
 
         self.is_physical   = False                          # Has physical address
         self.is_hidden     = False                          # Hide node in UI (file system related or null nodes by default)
-        self.is_boundary   = False                          # The entrypoint node for the VFS (always the last node appended to root)
+        self.is_boundary   = False                          # The entrypoint node for the VFS, as specified by the source profile
 
         self._lock                   = threading.RLock()     # Structural lock for parent-child mutations/access
         self.expansion_pending: bool = False                 # True while an expansion is in-flight
@@ -139,6 +140,11 @@ class VfsNode:
         '''Set the pending data for this node'''
         with self._lock:
             self._pending_data = value
+
+    @property
+    def is_sentinel(self) -> bool:
+        with self._lock:
+            return self._pending_data is None and (self._offset == -1 or self._size < 0)
 
     @property
     def size(self) -> int:
@@ -273,11 +279,12 @@ class VfsManager(QObject):
     def __init__(
         self,
         root:          VfsNode,
+        vfs_root:      VfsNode,
         node_enricher: Callable[[VfsNode], None] | None = None,
     ) -> None:
         super().__init__()
         self.root        = root
-        self.vfs_root    = self._resolve_vfs_boundary(root)
+        self.vfs_root    = self._validate_vfs_boundary(vfs_root)
         self.enrich_node = node_enricher
         self._lock       = threading.RLock()
 
@@ -287,13 +294,10 @@ class VfsManager(QObject):
         self._register_recursive(self.root, self.iso_nodes_by_id)   # Register physical nodes with VFS initilization
 
     @staticmethod
-    def _resolve_vfs_boundary(root: VfsNode) -> VfsNode:
-        if not root.children or not root.children[-1].is_boundary:
-            raise ValueError(
-                'VfsManager requires the VFS boundary node (is_boundary=True) '
-                'to already be the last node appended to root.'
-            )
-        return root.children[-1]
+    def _validate_vfs_boundary(vfs_root: VfsNode) -> VfsNode:
+        if not vfs_root.is_boundary:
+            raise ValueError(f'VfsManager requires an already resolved VFS boundary node: got {vfs_root!r}')
+        return vfs_root
 
     ###--------------------- Registration ----------------------###
 
@@ -335,7 +339,7 @@ class VfsManager(QObject):
                 child.is_hidden = bool(parent.is_hidden or not child.size or child.offset == -1)
                 if self.enrich_node:
                     self.enrich_node(child)
-                if not child.extension and not child.is_hidden:
+                if not child.extension and not child.is_hidden and not child.is_sentinel:
                     self.request_extension.emit(child)
                 parent.children.append(child)
                 self._register_recursive(child, self.vfs_nodes_by_id)
@@ -375,11 +379,13 @@ class VfsManager(QObject):
         '''
         if not self.enrich_node:
             return
-        for child in self.root.children[-1].children:
+        logger.warning(f'Enriching initial tree, the children of {self.vfs_root}')
+        for child in self.vfs_root.children:
+            logger.warning(f'Enriching child: {child.name}, size: {child.size}, offset {child.offset}')
             self.enrich_node(child)
-            # For building new metadata from scratch you will need to remove child.is_hidden for data center
-            # This could be designed better but won't matter to the average user
-            if not child.extension and not child.is_hidden:
+            if child.is_boundary:
+                continue
+            if not child.extension or child.extension == '.bin':
                 self.request_extension.emit(child)
         logger.debug('VfsManager.enrich_initial_tree: complete')
 
@@ -586,11 +592,45 @@ class NodeConflictError(Exception):
         others = [o.hierarchical_id for o in self.others]
         return f'NodeConflictError(node={self.node.hierarchical_id_str}, other={others})'
 
+@dataclass(eq=False)
+class ModGroup:
+    '''
+    One atomic pending file change.
+    Contains a group of members so that packages are treated as a single unit.
+    Package conflicts are checked by group.
+    The first member is the primary node (user acted).
+    '''
+    id:      int
+    members: tuple[VfsNode, ...]
+    staged:  bool = False
+
+    @property
+    def primary(self) -> VfsNode:
+        return self.members[0]
+
+    @property
+    def name(self) -> str:
+        extra = len(self.members) - 1
+        return self.primary.name if not extra else f'{self.primary.name} (+{extra} linked)'
+
+    @property
+    def size(self) -> int:
+        return sum(node.size for node in self.members)
+
+    def __iter__(self) -> Iterator[VfsNode]:
+        return iter(self.members)
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+    def __repr__(self) -> str:
+        return f'ModGroup(id={self.id}, members={self.members}, staged={self.staged})'
+
 class ModTracker(QObject):
-    '''Pure state tracker for modified nodes.'''
+    '''Pure state tracker for modified nodes, organized in ModGroups.'''
     node_modified = pyqtSignal(VfsNode)
     node_reverted = pyqtSignal(VfsNode)
-    state_changed = pyqtSignal(int, int)              # (unstaged_count, staged_count)
+    state_changed = pyqtSignal(int, int)              # (unstaged_count, staged_count) node counts not group counts
     conflict_detected = pyqtSignal(VfsNode, str)      # (VfsNode, reason)
     conflict_resolved = pyqtSignal(VfsNode)           # (VfsNode)
 
@@ -600,10 +640,43 @@ class ModTracker(QObject):
         self.rebuild_queue:  set[VfsNode] = set()
         self._originals:     dict[VfsNode, bytes] = {}
         self.conflicts:      set[VfsNode] = set()
+        self._groups:        dict[int, ModGroup] = {}
+        self._group_of:      dict[VfsNode, ModGroup] = {}
+        self._next_group:    int = 0
+        self._source:        BaseSource | None = None
+        self._links:         LinkLookup | None = None
         self._lock = threading.RLock()
+
+    def configure_source(self, source: BaseSource | None, links: LinkLookup | None) -> None:
+        with self._lock:
+            self._source = source
+            self._links = links
 
     def _emit_state(self):
         self.state_changed.emit(len(self.modified_nodes), len(self.rebuild_queue))
+
+
+    ###----------------------------------- Group Management -------------------------------------###
+
+    def group_of(self, node: VfsNode) -> ModGroup | None:
+        with self._lock:
+            return self._group_of.get(node)
+
+    def unstaged_groups(self) -> list[ModGroup]:
+        with self._lock:
+            return sorted((group for group in self._groups.values() if not group.staged),
+                          key=lambda group: group.name)
+
+    def staged_groups(self) -> list[ModGroup]:
+        with self._lock:
+            return sorted((group for group in self._groups.values() if group.staged),
+                          key=lambda group: group.name)
+
+    def staged_nodes(self) -> list[VfsNode]:
+        with self._lock:
+            return [node for group in self.staged_groups() for node in group.members]
+
+    ###----------------------------------- Modification -------------------------------------###
 
     def apply_modification(
         self,
@@ -613,32 +686,77 @@ class ModTracker(QObject):
         *,
         force:        bool = False,
     ) -> bytes:
+        return self.apply_group([(node, new_data)], data_sources, force=force)[node]
+
+    def apply_group(
+        self,
+        changes:      Sequence[tuple[VfsNode, bytes]],
+        data_sources: Callable[[VfsNode], bytes],
+        *,
+        force:        bool = False,
+    ) -> dict[VfsNode, bytes]:
+        '''
+        Apply a group of modifications as a ModGroup, this ensures that members never
+        conflict with each other.
+        Returns node and original data.
+        '''
+        if not changes:
+            return {}
+        applied: dict[VfsNode, bytes] = {}
         with self._lock:
-            conflicts = self.find_hierarchical_conflicts(node) + self.find_dependency_conflicts(node)
-            if conflicts and not force:
-                raise NodeConflictError(node, conflicts)
-            if conflicts:
+            group_nodes = frozenset(n for n, _ in changes)
+            if len(group_nodes) != len(changes):
+                raise ValueError('apply_group: duplicate nodes in one group')
+            found: list[tuple[VfsNode, list[ConflictInfo]]] = []
+            for node, _ in changes:
+                conflicts = self._conflicts_for(node, group_nodes, check_package=True)
+                if conflicts:
+                    found.append((node, conflicts))
+            if found and not force:
+                raise NodeConflictError(*found[0])
+            conflicted = {node for node, _ in found}
+            for node, conflicts in found:
                 combined_reason = '; '.join(c.reason for c in conflicts)
                 logger.warning(f'Conflict on {node} forced through: {combined_reason}')
                 if node not in self.conflicts:
                     self.conflicts.add(node)
                     self.conflict_detected.emit(node, combined_reason)
-            else:
-                self.resolve_conflict(node)
+            for node, _ in changes:
+                if node not in conflicted:
+                    self.resolve_conflict(node)
+            #
+            for old in {self._group_of[node] for node in group_nodes if node in self._group_of}:
+                remaining = tuple(node for node in old.members if node not in group_nodes)
+                for node in old.members:
+                    self._group_of.pop(node, None)
+                if remaining:
+                    shrunk = ModGroup(old.id, remaining, old.staged)
+                    self._groups[old.id] = shrunk
+                    for node in remaining:
+                        self._group_of[node] = shrunk
+                else:
+                    self._groups.pop(old.id, None)
 
-            previous = node.pending_data
-            if node not in self._originals:
-                self._originals[node] = previous if previous is not None else data_sources(node)
-            if previous is None:
-                previous = self._originals[node]
-            self.rebuild_queue.discard(node)
-            node.pending_data = new_data
-            node.size         = len(new_data)
-            node.status       = NodeStatus.MODIFIED
-            self.modified_nodes.add(node)
-        self.node_modified.emit(node)
+            group = ModGroup(self._next_group, tuple(node for node, _ in changes))
+            self._next_group += 1
+            self._groups[group.id] = group
+            for node, new_data in changes:
+                previous = node.pending_data
+                if node not in self._originals:
+                    self._originals[node] = previous if previous is not None else data_sources(node)
+                if previous is None:
+                    previous = self._originals[node]
+                self.rebuild_queue.discard(node)
+                node.pending_data = new_data
+                node.size         = len(new_data)
+                node.status       = NodeStatus.MODIFIED
+                self.modified_nodes.add(node)
+                self._group_of[node] = group
+                applied[node] = previous
+        for node, _ in changes:
+            self.node_modified.emit(node)
         self._emit_state()
-        return previous
+        return applied
 
     def mark_modified(self, node: VfsNode, new_data: bytes, original_data: bytes, *, force: bool = False) -> None:
         '''Back compatible temp entrypoint for callers that already have original data.'''
@@ -652,39 +770,101 @@ class ModTracker(QObject):
         with self._lock:
             return node in self._originals
 
-    def stage_node(self, node: VfsNode) -> None:
+    ###-------------------------------------- Staging - Group ---------------------------------------###
+    #
+    def stage_group(self, group: ModGroup) -> list[ConflictInfo]:
         '''Move from cache to staging area'''
         with self._lock:
-            if node not in self.modified_nodes:
-                return
-            self.modified_nodes.remove(node)
-            self.rebuild_queue.add(node)
-            node.status = NodeStatus.STAGED
+            if self._groups.get(group.id) is not group or group.staged:
+                return []
+            conflicts = self.group_conflicts(group)
+            if conflicts:
+                return conflicts
+            for node in group.members:
+                self.modified_nodes.discard(node)
+                self.rebuild_queue.add(node)
+                node.status = NodeStatus.STAGED
+            group.staged = True
         self._emit_state()
+        return []
 
-    def unstage_node(self, node: VfsNode) -> None:
+    def unstage_group(self, group: ModGroup) -> None:
         '''Move from staging back to cache'''
         with self._lock:
-            if node not in self.rebuild_queue:
+            if self._groups.get(group.id) is not group or not group.staged:
                 return
-            self.rebuild_queue.remove(node)
-            self.modified_nodes.add(node)
-            node.status = NodeStatus.MODIFIED
+            for node in group.members:
+                self.rebuild_queue.discard(node)
+                self.modified_nodes.add(node)
+                node.status = NodeStatus.MODIFIED
+            group.staged = False
         self._emit_state()
 
-    def revert_node(self, node: VfsNode) -> None:
-        '''Discard changes'''
+    def stage_all(self) -> dict[ModGroup, list[ConflictInfo]]:
+        '''Stage every group in the queue, returns conflicts if any.'''
+        refused: dict[ModGroup, list[ConflictInfo]] = {}
+        for group in self.unstaged_groups():
+            conflicts = self.stage_group(group)
+            if conflicts:
+                refused[group] = conflicts
+        return refused
+
+    def unstage_all(self) -> None:
+        for group in self.staged_groups():
+            self.unstage_group(group)
+
+    def revert_group(self, group: ModGroup) -> None:
+        '''Discard a whole group's changes'''
         with self._lock:
-            self.modified_nodes.discard(node)
-            self.rebuild_queue.discard(node)
-            node.size = len(self._originals[node])
-            self._originals.pop(node, None)
-            node.clear_pending()
-            node.status = NodeStatus.UNMODIFIED
-            self.resolve_conflict(node)
-        logger.info(f'Reverted changes for node: {node}')
-        self.node_reverted.emit(node)
+            if self._groups.get(group.id) is not group:
+                return
+            members = list(group.members)
+            self._drop_group(group)
+            for node in members:
+                self._revert_locked(node)
+            self._refresh_conflict_flags()
+        for node in members:
+            self.node_reverted.emit(node)
+            logger.info(f'Reverted changes for node: {node}')
         self._emit_state()
+
+    def revert_all(self) -> None:
+        for group in self.unstaged_groups() + self.staged_groups():
+            self.revert_group(group)
+
+    ###-------------------------------------- Staging - Node -----------------------------------###
+
+    def stage_node(self, node: VfsNode) -> None:
+        group = self.group_of(node)
+        if group is not None:
+            self.stage_group(group)
+
+    def unstage_node(self, node: VfsNode) -> None:
+        group = self.group_of(node)
+        if group is not None:
+            self.unstage_group(group)
+
+    def revert_node(self, node: VfsNode) -> None:
+        '''Discard changes and revert the group's members if applicable.'''
+        group = self.group_of(node)
+        if group is not None:
+            self.revert_group(group)
+
+    def _drop_group(self, group: ModGroup) -> None:
+        self._groups.pop(group.id, None)
+        for node in group.members:
+            if self._group_of.get(node) is group:
+                del self._group_of[node]
+
+    def _revert_locked(self, node: VfsNode) -> None:
+        self.modified_nodes.discard(node)
+        self.rebuild_queue.discard(node)
+        if node in self._originals:
+            node.size = len(self._originals[node])
+        self._originals.pop(node, None)
+        node.clear_pending()
+        node.status = NodeStatus.UNMODIFIED
+        self.resolve_conflict(node)
 
     def clear(self) -> None:
         '''Clear state when closing an ISO'''
@@ -694,11 +874,14 @@ class ModTracker(QObject):
             self.modified_nodes.clear()
             self.rebuild_queue.clear()
             self._originals.clear()
+            self._group_of.clear()
+            self._groups.clear()
             self.conflicts.clear()
         self._emit_state()
 
     def clear_subtree(self, node: VfsNode) -> None:
         '''Clears all state tracking for a node and all it's children.'''
+        outside: list[VfsNode] = []
         with self._lock:
             stack = [node]
             subtree: set[VfsNode] = set()
@@ -706,6 +889,9 @@ class ModTracker(QObject):
                 current = stack.pop()
                 subtree.add(current)
                 stack.extend(current.children)
+            for group in {self._group_of[node] for node in subtree if node in self._group_of}:
+                self._drop_group(group)
+                outside.extend(node for node in group.members if node not in subtree)
             for n in subtree:
                 if n in self.modified_nodes or n in self.rebuild_queue or n in self._originals:
                     n.clear_pending()
@@ -713,13 +899,25 @@ class ModTracker(QObject):
                 self.rebuild_queue.discard(n)
                 self._originals.pop(n, None)
                 self.resolve_conflict(n)
+            for node in outside:
+                self._revert_locked(node)
+            self._refresh_conflict_flags()
+        for node in outside:
+            self.node_reverted.emit(node)
         self._emit_state()
 
     ###---------------------------- Conflict -----------------------------###
 
-    def find_hierarchical_conflicts(self, incoming_node: VfsNode) -> list[ConflictInfo]:
-        '''Detect and report ancestor/descendant data corruption cases'''
-        pending = self.modified_nodes | self.rebuild_queue
+    def _pending_excluding(self, node: VfsNode, exclude: frozenset[VfsNode] | None) -> frozenset[VfsNode]:
+        '''Pending edits other than node and exclude'''
+        if exclude is None:
+            group   = self._group_of.get(node)
+            exclude = frozenset(group.members) if group is not None else frozenset()
+        return frozenset((self.modified_nodes | self.rebuild_queue) - exclude - {node})
+
+    def find_hierarchical_conflicts(self, incoming_node: VfsNode, exclude: frozenset[VfsNode] | None = None) -> list[ConflictInfo]:
+        '''Detect and report ancestor/descendant data corruption cases. Pure tree datatype shape.'''
+        pending = self._pending_excluding(incoming_node, exclude)
         conflicts: list[ConflictInfo] = []
         # Child modification may not conflict if the pending data is the source that is edited.
         # This depends on how I have the rebuild setup but currently because of leaf -> source
@@ -735,8 +933,6 @@ class ModTracker(QObject):
                      'overwritten by the parent modifications during rebuild.')
                 ))
         for descendant in pending:
-            if descendant is incoming_node:
-                continue
             if incoming_node in descendant.walk_to_physical():
                 conflicts.append(ConflictInfo(
                     descendant,
@@ -746,46 +942,67 @@ class ModTracker(QObject):
                 ))
         return conflicts
 
-    def find_dependency_conflicts(self, incoming_node: VfsNode) -> list[ConflictInfo]:
-        '''Detect and report datacenter conflicts'''
+    def find_source_conflicts(self, incoming_node: VfsNode, exclude: frozenset[VfsNode] | None = None) -> list[ConflictInfo]:
+        '''Filesystem conflicts as defined by the active source profile.'''
+        if self._source is None or self._links is None:
+            return []
+        pending = self._pending_excluding(incoming_node, exclude)
+        if not pending:
+            return []
+        return [ConflictInfo(f.other, f.reason) for f in self._source.find_conflicts(incoming_node, pending, self._links)]
 
-        # If a node in the pool is a datacenter node (5,) and there is not a target inside the queue
-        # If a node with a target is directly modified and there is no target inside the queue
-        pending = self.modified_nodes | self.rebuild_queue
-        conflicts: list[ConflictInfo] = []
-        # if incoming_node.target is not None:
-        #     for target in pending:
-        #         if target is incoming_node:
-        #            continue
-        #         if target.hierarchical_id == incoming_node.target:
-        #             conflicts.append(ConflictInfo(
-        #                 target,
-        #                 (f'{incoming_node} depends on header from {target} '
-        #                  'which has pending modifications of its own.')
-        #             ))
-        # for payload in pending:
-        #     if payload is incoming_node:
-        #         continue
-        #     if payload.target == incoming_node.hierarchical_id:
-        #         conflicts.append(ConflictInfo(
-        #             payload,
-        #             (f'{payload} depends on header from {incoming_node} which '
-        #              'has pending modifications of its own.')
-        #         ))
-        return conflicts
+    def _conflicts_for(
+        self,
+        node:          VfsNode,
+        exclude:       frozenset[VfsNode] | None,
+        check_package: bool = False
+    ) -> list[ConflictInfo]:
+        '''All conflicts for a node outside of the current group.'''
+        found: list[ConflictInfo] = []
+        if check_package:
+            group = self._group_of.get(node)
+            if group is not None and exclude is not None:
+                for peer in group.members:
+                    if peer is not node and peer not in exclude:
+                        found.append(ConflictInfo(
+                            peer,
+                            (f'{node} was modified together with {peer} as one package. '
+                             f'Editing it alone may break the package integrity.')
+                        ))
+        found += self.find_hierarchical_conflicts(node, exclude=exclude)
+        found += self.find_source_conflicts(node, exclude=exclude)
+        unique: dict[VfsNode, ConflictInfo] = {}
+        for conflict in found:
+            unique.setdefault(conflict.other, conflict)
+        return list(unique.values())
+
+    def group_conflicts(self, groups: ModGroup) -> list[ConflictInfo]:
+        '''Conflicts between a group and anything outside of it.'''
+        with self._lock:
+            members = frozenset(groups.members)
+            unique: dict[VfsNode, ConflictInfo] = {}
+            for node in groups.members:
+                for conflict in self._conflicts_for(node, members):
+                    unique.setdefault(conflict.other, conflict)
+            return list(unique.values())
+
+    def _refresh_conflict_flags(self) -> None:
+        '''Drop conflict flags whose conflicts no longer exist'''
+        for node in list(self.conflicts):
+            if node not in self.modified_nodes and node not in self.rebuild_queue or not self._conflicts_for(node, None):
+                self.resolve_conflict(node)
 
     def has_conflict(self, node: VfsNode) -> bool:
-        '''Whether node currently has any collisions with any pending edits.'''
+        '''Whether node currently has any collisions with any pending edits outside of its group'''
         with self._lock:
-            return bool(self.find_hierarchical_conflicts(node) or self.find_dependency_conflicts(node))
+            return bool(self._conflicts_for(node, None))
 
     def find_conflicts(self) -> list[tuple[VfsNode, ConflictInfo]]:
-        '''Tracker-wide scan for and conflicts in the pending modification lists.'''
+        '''Tracker-wide scan for any conflicts in the pending modification lists.'''
         with self._lock:
-            pending = self.modified_nodes | self.rebuild_queue
             results: list[tuple[VfsNode, ConflictInfo]] = []
-            for node in pending:
-                for conflict in self.find_hierarchical_conflicts(node) + self.find_dependency_conflicts(node):
+            for node in self.modified_nodes | self.rebuild_queue:
+                for conflict in self._conflicts_for(node, None):
                     results.append((node, conflict))
             return results
 

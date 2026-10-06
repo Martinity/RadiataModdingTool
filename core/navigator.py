@@ -1,8 +1,8 @@
 """
-Core VFS Navigation.
+Core FS Navigation.
 
-Handles multi-threaded tree expansions, deep filesystem traversals, and
-thread-isolated node roll-ups for rebuilding the VFS.
+Handles multi-threaded tree expansions, deep FS traversals, and
+thread-isolated node roll-ups for rebuilding the FS.
 
 Traversal API (Physical to Virtual):
     unwrap_chain            - Reads raw bytes from the physical layer up to the target node.
@@ -16,9 +16,15 @@ Expansion API (Concurrency-Safe Discovery):
     resolve_data_from_hid   - Resolves a target HID directly to raw bytes, triggering expansions as needed.
     unpack_recursive        - Deeply expands a target and all of its children recursively.
 
+Package API
+    package_members         - Ask the assembler which nodes a package's handler needs.
+    ensure_package          - None-blocking: expand until every member is reachable.
+    resolve_package         - Blocking: collect members + bytes into a ResolvedPackage.
+    open_handler            - Construct the handler for a package.
+
 Rebuild API (Thread-Isolated Operations):
     rollup_nodes            - Bottom-up VFS rebuild (deepest children up to physical parents).
-    precompute_datacenter   - Caches payloads and headers for non-sequential files prior to roll-up.
+    precompute_packages     - Rolls up nodes that depend on package members.
     clear_rollup_pending    - Flushes cached rebuild data. Executed safely on the main thread
                               after the dedicated rebuild thread concludes and unblocks the UI.
 """
@@ -26,12 +32,14 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING, Iterator
+from contextlib import contextmanager
 from core.node import VfsNode, VfsManager
 from core.registry import Registry
-from core.contracts import ContainerHandler, RebuildResult
+from core.contracts import ContainerHandler, LeafHandler, ResolvedPackage, PackageError, as_package_result, PackageIntent, BaseSource
 if TYPE_CHECKING:
     from core.workers import TaskHandle
+    from core.contracts import BaseHandler, PackageMember, LinkLookup
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -56,15 +64,19 @@ class VfsNavigator:
     MAX_RESOLUTION_DEPTH = 20
     def __init__(
             self,
-            vfs: VfsManager,
-            data_reader: Callable[[VfsNode], bytes],
-            expansion_callback: Callable[[VfsNode, threading.Event], None],
+            vfs:                 VfsManager,
+            data_reader:         Callable[[VfsNode], bytes],
+            expansion_callback:  Callable[[VfsNode, threading.Event], None],
             ghost_node_callback: Callable[[tuple[int, ...]], None] | None = None,
+            source_profile:      BaseSource | None = None,
+            links:               LinkLookup | None = None,
         ):
         self.vfs  = vfs
         self.read = data_reader
         self.expansion_callback  = expansion_callback
         self.ghost_node_callback = ghost_node_callback
+        self._source_profile     = source_profile
+        self._links     = links
         self._rollup_touched: set[VfsNode] = set()
 
         self._expand_waiters: dict[tuple[int, ...], list[Callable[[bool, VfsNode], None]]] = {}
@@ -172,7 +184,7 @@ class VfsNavigator:
         if not target:
             return None
 
-        logger.debug(f'Resolving datacenter header ID: {target}.')
+        logger.debug(f'Resolving HID: {target}.')
         for _ in range(self.MAX_RESOLUTION_DEPTH):
             snapshot = self.vfs.snapshot_hids([target])  # Get VFS snapshot
             if not snapshot.unresolved:  # target is already expanded
@@ -191,7 +203,7 @@ class VfsNavigator:
 
         node = self.vfs.get_vfs_node_by_id(target)
         if not node:
-            logger.warning(f'Could not resolve datacenter header: {target}')
+            logger.warning(f'Could not resolve HID: {target}')
             return None
         return self.read(node)
 
@@ -209,6 +221,69 @@ class VfsNavigator:
         '''Resolve target hid then expand all children recursively until no TREE_EXPAND actions remain.
         on_success does not continue to expand on failure, see _drill_down_to'''
         self.resolve_ghost_node(target_hid, lambda node: self._deep_unpack_layer([node], [], on_success))
+
+    ###---------------------------------- Packages ----------------------------------###
+
+    def package_members(self, node: VfsNode, intent: PackageIntent = PackageIntent.ACCESS) -> tuple[PackageMember, ...]:
+        '''What the active source says node's handler needs.'''
+        if self._source_profile is None or self._links is None:
+            return ()
+        return self._source_profile.members_for(node, intent, self._links)
+
+    def ensure_package(self, node: VfsNode, intent: PackageIntent, on_ready: Callable[[], None]) -> None:
+        '''Ensure the package for the given node is ready, calling on_ready when done.'''
+        pending = [m.hid for m in self.package_members(node, intent) if m.required]
+        def _next(_: VfsNode | None = None) -> None:
+            while pending and self.vfs.get_vfs_node_by_id(pending[0]) is not None:
+                pending.pop(0)
+            if not pending:
+                on_ready()
+                return
+            self.resolve_ghost_node(pending[0], _next)
+        _next()
+
+    def resolve_package(self, node: VfsNode, intent: PackageIntent = PackageIntent.ACCESS) -> ResolvedPackage | None:
+        '''Collect all the package's required members and their bytes, blocking until ready'''
+        specs = self.package_members(node, intent)
+        if not specs:
+            return None
+        members: dict[str, VfsNode] = {}
+        data:    dict[str, bytes] = {}
+        for spec in specs:
+            if spec.required:
+                member = self.vfs.get_vfs_node_by_id(spec.hid)
+                raw    = self.resolve_data_from_hid(spec.hid)
+            else:  # check the bytes so the VFS is not consulted (save nonexistant metadata HIDs)
+                member = self.vfs.get_vfs_node_by_id(spec.hid)
+                raw    = self.read(member) if member is not None else None
+            if raw is None or member is None:
+                if spec.required:
+                    raise PackageError(f'{node}: required package member {spec.role} at {spec.hid}')
+                logger.debug(f'{node}: optional package member "{spec.role}" at {spec.hid} not materialized - skipped')
+                continue
+            members[spec.role] = member
+            data[spec.role]    = raw
+        return ResolvedPackage(node, members, data)
+
+    @contextmanager
+    def open_handler(
+        self,
+        handler_class: type[BaseHandler],
+        node:          VfsNode,
+        task_handle:   TaskHandle,
+        raw_bytes:     bytes,
+        intent:        PackageIntent = PackageIntent.ACCESS,
+    ) -> Iterator[BaseHandler]:
+        '''Construct a handler injecting task_handle and package data.'''
+        if not issubclass(handler_class, (ContainerHandler, LeafHandler)):
+            raise TypeError(f'{handler_class.__name__} must be ContainerHandler or LeafHandler')
+        package = self.resolve_package(node, intent)
+        with handler_class(raw_bytes, node.parent) as handler:
+            handler.task_handle = task_handle
+            handler.package     = package
+            if package is not None:
+                handler.validate_package(node, package)
+            yield handler
 
     def rollup_nodes(self, staged_nodes: list[VfsNode], task_handle: TaskHandle) -> list[VfsNode]:
         '''For Rebuilding the VFS from deepest layer to physical (children -> parent)'''
@@ -238,34 +313,23 @@ class VfsNavigator:
                     logger.error(f'Subcontract {handler_class.__name__} must be ContainerHandler for virtual tree navigation.')
                     continue
                 parent_bytes = self.read(parent)
-                header_bytes = None
-                if parent.target:
-                    target_node = self.vfs.get_vfs_node_by_id(parent.target)
-                    if target_node is not None and target_node.pending_data:
-                        header_bytes = target_node.pending_data
-                    else:
-                        header_bytes = self.resolve_data_from_hid(parent.target)
-                with handler_class(parent_bytes, parent.parent) as handler:
-                    handler.task_handle = task_handle
-                    if header_bytes is not None and hasattr(handler, 'datacenter_header'):
-                        handler.datacenter_header = header_bytes
-                    result = handler.rebuild_node(parent, modified_children)
-                    if isinstance(result, RebuildResult): # Check for complexe build results
-                        payload, target_data = result
-                    else:
-                        payload, target_data = result, None
-                    parent.pending_data = payload
+                with self.open_handler(handler_class, parent, task_handle, parent_bytes) as handler:
+                    result = as_package_result(handler.rebuild_node(parent, modified_children))
+                    parent.pending_data = result.payload
                     self._rollup_touched.add(parent)
-                    if target_data and parent.target: # Datacenter rebuild
-                        self.resolve_data_from_hid(parent.target) # Ensure target is in VFS
-                        target_node = self.vfs.get_vfs_node_by_id(parent.target)
-                        if target_node:
-                            target_node.pending_data = target_data
-                            self._rollup_touched.add(target_node)
-                            current_queue.add(target_node)
-                            task_handle.log_message.emit(f'Datacenter modification queued: {parent.name} -> {parent.target}')
-                        else:
-                            task_handle.log_message.emit(f'CRITICAL: Could not find target node {parent.target} in VFS. Target may not exist')
+                    for role, data in (result.companions or {}).items():
+                        member = handler.package.members.get(role) if handler.package else None
+                        if member is None:
+                            task_handle.log_message.emit(
+                                f'{parent} returned package member {role} but its package has no such member'
+                            )
+                            continue
+                        member.pending_data = data
+                        self._rollup_touched.add(member)
+                        current_queue.add(member)
+                        task_handle.log_message.emit(
+                            f'Package member queued: {parent} -> {role} {member.hierarchical_id}'
+                        )
                     current_queue.add(parent)
 
             for node in deepest_nodes: # update the queue
@@ -274,7 +338,7 @@ class VfsNavigator:
         task_handle.log_message.emit('Virtual node roll-up complete')
         return list(current_queue)
 
-    def precompute_datacenter(self, staged_nodes: list[VfsNode], task_handle: TaskHandle) -> list[VfsNode]:
+    def precompute_packages(self, staged_nodes: list[VfsNode], task_handle: TaskHandle) -> list[VfsNode]:
         '''Cache payload/headers that are not located sequentially on disk'''
         nonseq_nodes: set[VfsNode] = set()
         staged_sorted = sorted(staged_nodes, key=lambda node: node.hierarchical_id)
@@ -282,7 +346,7 @@ class VfsNavigator:
         for node in staged_sorted:
             current_node = node
             while current_node is not None:
-                if current_node.target and current_node.parent:
+                if current_node.parent and self.package_members(current_node):
                     task_handle.log_message.emit(f'Sending {node} to cached roll-up')
                     nonseq_nodes.add(node)
                     break

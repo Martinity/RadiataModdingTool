@@ -5,7 +5,10 @@ HEADERS = {
     # Core containers
     b'SLZ'    : '.slz',
     b'SLE'    : '.sle',
+    b'ZLS'    : '.zls',
     b'Kods'   : '.kods',
+    b'MWo3'   : '.mwo3',
+    b'PACK'   : '.pack',
     b'1bcb'   : '.bcb',
     b'VIB'    : '.vib',
     (0x464C457F).to_bytes(4, 'little'): ".IRX", # changed to match the ISO files
@@ -14,6 +17,8 @@ HEADERS = {
     b'SEQW'   : '.seqw',
     b'VAGp'   : '.VAG',
     (0x000020).to_bytes(3, 'little'): ".020",
+    (0x000010).to_bytes(3, 'little'): ".010",
+    (0x000000).to_bytes(3, 'little'): ".000",
     # Movie
     (0x225277).to_bytes(3, 'little'): ".fmv",
     # Mesh
@@ -53,6 +58,12 @@ HEADERS = {
     b'RCP'    : '.rcp',
     b'RCAD'   : '.rcad',
     (0x89504E47).to_bytes(4, 'big'): ".png",
+    b'DTT'    : '.dtt',
+    b'so3m'   : '.mclib',
+    b'mcps'   : '.mclib1.5',
+    b'DMY'    : '.dmy',
+    b'DCM'    : '.dcm',
+    b'CRC'    : '.crc',
 }
 
 @lru_cache(maxsize=1)

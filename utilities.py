@@ -20,6 +20,7 @@ def get_resource_path(relative_path: str | Path) -> Path:
     '''
     Used to get the path to an asset, either from the frozen build or from source.
     '''
+    relative_path = str(relative_path).lstrip('/\\')
     if hasattr(sys, '_MEIPASS'): # For frozen builds
         base_path = Path(sys._MEIPASS)
     else: # For running from source
