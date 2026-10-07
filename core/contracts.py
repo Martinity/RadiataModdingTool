@@ -3,11 +3,15 @@ Contracts for handlers, editors, and sources.
 
 Contract map:
 
-    Handlers   BaseHandler > PhysicalHandler / ContainerHandler / LeafHandler
-    Editors    BaseEditor  > BaseViewer
-    Sources    BaseSource  > BaseSignatureValidator / BaseTocCodec / BaseBoundaryResolver / BaseExtensionResolver / BasePackageAssembler / BaseConflictDetector / BaseMetadataBuilder / BasePatch / BaseSourceBuilder
-               BasePatch   > BaseDirectPatch / BaseDelegatedPatch
-               BaseSourceBuilder
+    Handlers    BaseHandler > PhysicalHandler / ContainerHandler / LeafHandler
+    Editors     BaseEditor  > BaseViewer
+    Sources     BaseSource  > BaseSignatureValidator / BaseTocCodec / BaseBoundaryResolver / BaseExtensionResolver / BasePackageAssembler / BaseConflictDetector / BaseMetadataBuilder / BasePatch / BaseSourceBuilder
+                  .Extensions         source.extensions.resolve(node, header)
+                  .Packages           source.packages.members(...) / .conflicts(...)
+                  .Metadata           source.metadata.build(store)
+                  .Patches           source.Patches.items / .options / .active(flags)
+                BasePatch   > BasePhysicalPatch / BaseVirtualPatch
+                BaseSourceBuilder
 '''
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import array
 import inspect
 import struct
 import sys
+from functools import cached_property
 from dataclasses import dataclass, field
 from enum import Flag, Enum, auto
 from pathlib import Path
@@ -1039,7 +1044,6 @@ class BaseSource(abc.ABC):
     geometry:           ClassVar[SourceGeometry] = SourceGeometry()
     hidden_toc_indices: ClassVar[frozenset[int]] = frozenset()
     runtime_file_names: ClassVar[frozenset[str]] = frozenset()
-    patches:            ClassVar[tuple[BasePatch, ...]] = ()
     build_hashes:       ClassVar[dict[str, str]] = {}
     metadata_path:      ClassVar[str] = ''
 
@@ -1086,32 +1090,65 @@ class BaseSource(abc.ABC):
         root.append_child(boundary)
         return boundary
 
-    def resolve_extension(self, node: VfsNode, header: bytes) ->  str:
-        '''Return the node's extension from its header bytes.'''
-        return '.bin'
+    ###-------------------- Components --------------------###
 
-    ### Packages / Conflicts / Metadata
-    def members_for(self, node: VfsNode, intent: PackageIntent, links: LinkLookup) -> tuple[PackageMember, ...]:
-        '''Return the members (nodes) that make up a package, or () if not a package.'''
-        return ()
+    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches',)
 
-    def find_conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[ConflictFinding]:
-        '''Returns the conflicts between the incoming node and the pending nodes.'''
-        return []
+    class Extensions:
+        '''Specify any custom extension resolution logic.'''
+        def __init__(self, source: BaseSource) -> None:
+            self._source = source
+        def resolve(self, node: VfsNode, header: bytes) ->  str:
+            '''Return the node's extension from its header bytes.'''
+            return '.bin'
 
-    def build_metadata(self, store: NodeMetadataStore) -> int:
-        '''Build a metadata store from scratch.'''
-        return 0
+    class Packages:
+        '''Specify any custom package structures.'''
+        def __init__(self, source: BaseSource) -> None:
+            self._source = source
+        def members(self, node: VfsNode, intent: PackageIntent, links: LinkLookup) -> tuple[PackageMember, ...]:
+            '''Return the members (nodes) that make up a package, or () if not a package.'''
+            return ()
+        def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[ConflictFinding]:
+            '''Returns the conflicts between the incoming node and the pending nodes.'''
+            return []
 
-    ### Patches
-    @property
-    def patch_options(self) -> tuple[BasePatch, ...]:
-        '''User toggleable patches.'''
-        return tuple(selectable_patches(self.patches))
+    class Metadata:
+        '''Specify any custom metadata building logic.'''
+        def __init__(self, source: BaseSource) -> None:
+            self._source = source
+        def build(self, store: NodeMetadataStore) -> int:
+            '''Build a metadata store from scratch.'''
+            return 0
 
-    def patches_for(self, flags: SourceRebuildFlags) ->  list[BasePatch]:
-        '''Patches active for a rebuild with these flags. (NONE is always active)'''
-        return [patch for patch in self.patches if patch.is_active(flags)]
+    class Patches:
+        '''Specify any custom patching logic.'''
+        items: ClassVar[tuple[BasePatch, ...]] = ()
+        def __init__(self, source: BaseSource) -> None:
+            self._source = source
+        @property
+        def options(self) -> tuple[BasePatch, ...]:
+            '''Exposes all user-selectable patches to the UI for the source.'''
+            return tuple(selectable_patches(self.items))
+        def active(self, flags: SourceRebuildFlags) -> list[BasePatch]:
+            '''Patches active for a rebuild with these flags. (NONE is always active)'''
+            return [patch for patch in self.items if patch.is_active(flags)]
+
+    @cached_property
+    def extensions(self) -> Extensions:
+        return self.Extensions(self)
+
+    @cached_property
+    def packages(self) -> Packages:
+        return self.Packages(self)
+
+    @cached_property
+    def metadata(self) -> Metadata:
+        return self.Metadata(self)
+
+    @cached_property
+    def patches(self) -> Patches:
+        return self.Patches(self)
 
     ### Registration check
     @classmethod
@@ -1140,10 +1177,20 @@ class BaseSource(abc.ABC):
         #     raise TypeError(f'{name}.builder must be a BaseSourceBuilder subclass (the class, not an instance).')
         # if inspect.isabstract(cls.builder):
         #     raise TypeError(f'{name}.builder {cls.builder.__name__} is abstract; implement {sorted(cls.builder.__abstractmethods__)}.')
+        for attr in BaseSource.COMPONENTS:
+            base      = getattr(BaseSource, attr)
+            component = getattr(cls, attr, None)
+            if component is base:
+                raise TypeError(
+                    f'{name} must specify its own `{attr}` component. Add this to the class body:\n'
+                    f'    class {attr}(BaseSource.{attr}): ...'
+                )
+            if not (isinstance(component, type) and issubclass(component, base)):
+                raise TypeError(f'{name}.{attr} must be a class that subclasses BaseSource.{attr}, got {component!r}.')
         seen: set[str] = set()
-        for patch in cls.patches:
+        for patch in cls.Patches.items:
             if not isinstance(patch, BasePatch):
-                raise TypeError(f'{name}.patches must hold BasePatch instances, got {patch!r}.')
+                raise TypeError(f'{name}.Patches.items must hold BasePatch instances, got {patch!r}.')
             if inspect.isabstract(type(patch)):
                 raise TypeError(f'Patch {type(patch).__name__} is abstract; implement {sorted(type(patch).__abstractmethods__)}.')
             if not isinstance(patch.flag, cls.rebuild_flags):
