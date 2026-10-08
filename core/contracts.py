@@ -5,13 +5,15 @@ Contract map:
 
     Handlers    BaseHandler > PhysicalHandler / ContainerHandler / LeafHandler
     Editors     BaseEditor  > BaseViewer
-    Sources     BaseSource  > BaseSignatureValidator / BaseTocCodec / BaseBoundaryResolver / BaseExtensionResolver / BasePackageAssembler / BaseConflictDetector / BaseMetadataBuilder / BasePatch / BaseSourceBuilder
+    Sources     BaseSource
                   .Extensions         source.extensions.resolve(node, header)
                   .Packages           source.packages.members(...) / .conflicts(...)
                   .Metadata           source.metadata.build(store)
-                  .Patches           source.Patches.items / .options / .active(flags)
-                BasePatch   > BasePhysicalPatch / BaseVirtualPatch
-                BaseSourceBuilder
+                  .Patches            source.patches.items / .options / .active(flags) / .locate(...)
+                                        .BasePatch > .BasePhysicalPatch / .BaseVirtualPatch
+                  .Builder            source.create_builder(...) (.Regions)
+
+BaseSources components automatically inherit from the matching class.
 '''
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ import array
 import inspect
 import struct
 import sys
+import types
 from functools import cached_property
 from dataclasses import dataclass, field
 from enum import Flag, Enum, auto
@@ -647,7 +650,7 @@ class TocRegion(DiskRegion):
     sector_size:   int
     scramble_fn:   Callable[[list[int]], list[int]]
     entries:       list[tuple[VfsNode, DiskRegion | None]] = field(default_factory=list)
-                      # ^^ Node, Self-reference or sentinel ^^
+                      # (Node, Self-reference or sentinel)
     @property
     def size(self) -> int:
         return self.total_entries * 3 * 4
@@ -759,123 +762,16 @@ class RebuildContext:
     values:    dict[str, Any] = field(default_factory=dict)
     regions:   dict[str, DiskRegion] = field(default_factory=dict)
     sector_size: int = 0x800
+
     def __getitem__(self, key: str) -> Any:
         return self.values[key]
+
     def lba_of(self, name: str) -> int:
         '''Return the LBA of the given region in the layout.'''
         try:
             return self.regions[name].start_offset // self.sector_size
         except KeyError:
             raise KeyError(f'No region named {name!r} in this layout. Known regions: {", ".join(self.regions.keys())}')
-
-class BasePatch(abc.ABC):
-    '''Overarching base class for all patches.
-    BasePhysicalPatch  patches bytes of a physical file
-    BaseVirtualPatch   patches bytes of a virtual file
-    '''
-    name:         ClassVar[str] = ''
-    description:  ClassVar[str] = ''
-    flag:         ClassVar[SourceRebuildFlags]
-    is_physical:  ClassVar[bool]
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if 'spec_id' not in cls.__dict__:
-            return
-        if not hasattr(cls, 'flag'):
-            raise TypeError(f'{cls.__name__} must define a flag')
-        if cls.flag.value and not cls.name:
-            raise TypeError(f'{cls.__name__}: user selectable patches must define a name')
-
-    @property
-    def is_virtual(self) -> bool:
-        return not self.is_physical
-
-    @property
-    def is_user_selectable(self) -> bool:
-        '''Currently only return False on NONE (0) flag...'''
-        return bool(self.flag.value)
-
-    def is_active(self, flags: SourceRebuildFlags) -> bool:
-        '''Whether this patch applies for the requested rebuild flags.'''
-        return not self.flag.value or bool(flags & self.flag)
-
-class BasePhysicalPatch(BasePatch):
-    '''
-    Patches bytes of a physical file in place during the rebuild process itself (PhysicalHandler).
-
-    Must implement:
-        candidate_selector(all_nodes)       filter which nodes this patch applies to
-        locate(raw_data)                    find the relative offset of the patch site, or None when it is not present
-        compute_value(context)              calculate the payload to inject
-        apply(data, offset, value)          apply the computed value to the bytearray at offset
-    '''
-    is_physical: ClassVar[bool] = True
-
-    @abc.abstractmethod
-    def candidate_selector(self, all_nodes: list[VfsNode]) -> list[VfsNode]:
-        '''Filter which nodes this patch applies to.'''
-
-    @abc.abstractmethod
-    def locate(self, raw_data: bytes) -> int | None:
-        '''Find the relative offset of the patch site, or None when it is not present.'''
-
-    @abc.abstractmethod
-    def compute_value(self, context: RebuildContext) -> int:
-        '''Calculate the payload to inject.'''
-
-    @abc.abstractmethod
-    def apply(self, data: bytearray, offset: int, value: int) -> None:
-        '''Apply the computed value to the bytearray at offset.'''
-
-class BaseVirtualPatch(BasePatch):
-    '''
-    Delegated virtual patch. Runs through a Leaf or Container handler `action` on node `hid`.
-
-    Must implement:
-        action      the handler action name
-        hid         hierarchical id of the node to apply the patch to
-    '''
-    is_physical: ClassVar[bool] = False
-    action:      ClassVar[str]
-    hid:         ClassVar[tuple[int, ...]]
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if 'spec_id' in cls.__dict__ and not (hasattr(cls, 'action') and hasattr(cls, 'hid')):
-            raise TypeError(f'{cls.__name__}: delegated patches must define both `action` and `hid`.')
-
-Patches = tuple[BasePatch, ...]
-
-def selectable_patches(patches: Sequence[BasePatch]) -> list[BasePatch]:
-    '''Patches the user can toggle (in declaration order).'''
-    return [patch for patch in patches if patch.is_user_selectable]
-
-@dataclass(frozen=True)
-class PatchSite:
-    '''One resolved location for a direct PatchTarget's spec, provided by PatchLocator.'''
-    node:            VfsNode
-    relative_offset: int
-    patch:            BasePhysicalPatch
-
-class PatchLocator:
-    '''Runs every physical patch against the physical nodes to find where it can be applied.'''
-    def locate_all(
-        self,
-        handle:    BlockDevice,
-        all_nodes: list[VfsNode],
-        patches:   Sequence[BasePatch]
-    ) -> list[PatchSite]:
-        sites: list[PatchSite] = []
-        for patch in patches:
-            if not isinstance(patch, BasePhysicalPatch):
-                continue
-            for node in patch.candidate_selector(all_nodes):
-                raw = handle.pread(node.offset, node.size)
-                offset = patch.locate(raw)
-                if offset is not None:
-                    sites.append(PatchSite(node, offset, patch))
-        return sites
 
 ###------------------------------ Rebuild Planner ------------------------------------###
 
@@ -937,127 +833,110 @@ class DiskLayoutPlanner:
                 task_handle.progress.emit(pct)
         return bytes_written
 
-###-------------------------------------- Source Layout --------------------------------------##
-
-class BaseSourceBuilder(abc.ABC):
-    '''
-    Plans and writes on a rebuilt source. A source implements one subclass; SourceHandler constructs it.
-
-    Must Implement:
-        build_layout()              add every region front to back with add_region()
-
-    Entrypoint (do not override):
-        build(dist, task_handle)    build_layout() > resolve_offsets() > write_all(), return bytes_written
-
-    Optional Implement:
-        source                      the BaseSource being built
-        source_root                 the root directory of the ISO being built
-        vfs_root                    the root directory of the VFS being built
-        staged                      the set of nodes that have been staged
-        flags                       the flags for the source rebuild
-        toc, pvd, gap_nodes, geomtry, handle
-        patch_sites                 the list of patch sites for the source rebuild
-        sites_for(node)             the patch sites for a given node
-        lba_of(name)                LBA of a given region name
-        rebuild_context             the rebuild context for BinaryPatchRegion so patches can read named regions
-        log(message)                progress message to the UI
-    '''
-    def __init__(
-        self,
-        *,
-        source:      BaseSource,
-        handle:      BlockDevice,
-        source_root: VfsNode,
-        vfs_root:    VfsNode,
-        staged:      frozenset[VfsNode],
-        flags:       SourceRebuildFlags,
-        toc:         list[TocEntry],
-        patch_sites: list[PatchSite],
-        pvd:         RootDirectoryStructure,
-        gap_nodes:   list[VfsNode],
-        log:         Callable[[str], None] | None = None,
-    ) -> None:
-        self.source      = source
-        self.geometry    = source.geometry
-        self.handle      = handle
-        self.source_root = source_root
-        self.vfs_root    = vfs_root
-        self.staged      = staged
-        self.flags       = flags
-        self.toc         = toc
-        self.pvd         = pvd
-        self.gap_nodes   = gap_nodes
-        self.log         = log or (lambda message: None)
-
-        self.planner: DiskLayoutPlanner = DiskLayoutPlanner()
-        self.named:   dict[str, DiskRegion] = {}
-        self.rebuild_context = RebuildContext(regions=self.named, sector_size=self.geometry.sector_size)
-
-        self.patch_sites = [site for site in patch_sites if site.patch.is_active(flags)]
-        self._sites_by_node: dict[VfsNode, list[PatchSite]] = {}
-        for site in self.patch_sites:
-            self._sites_by_node.setdefault(site.node, []).append(site)
-
-    ### Contract
-    @abc.abstractmethod
-    def build_layout(self) -> None:
-        '''Subclasses must implement this method to build the layout, by calling self.add_region() sequentially.'''
-
-    ### Entrypoint
-    def build(self, dst: BinaryIO, task_handle: TaskHandle, progress_every: int = 1) -> int:
-        '''Plan, resolve and write a new source. Returns the number of bytes written.'''
-        self.build_layout()
-        self.log(f'Resolving phyiscal disk layout offsets for {len(self.planner.regions)} regions')
-        self.planner.resolve_offsets()
-        self.log('Starting sequential write...')
-        return self.planner.write_all(dst, task_handle, progress_every)
-
-    ### Helpers for build_layout
-    def add_region(self, region: DiskRegion, name: str | None = None, alignment: int | None = None) -> DiskRegion:
-        '''Append a region. Give it a name and look it up later (lab_of, patches)'''
-        if name is not None:
-            if name in self.named:
-                raise ValueError(f"Layout already defines a region for name {name!r}")
-            self.named[name] = region
-        return self.planner.add(region, alignment=alignment)
-
-    def lba_of(self, name: str) -> int:
-        return self.rebuild_context.lba_of(name)
-
-    def sites_for(self, node: VfsNode) -> list[PatchSite]:
-        return self._sites_by_node.get(node, [])
-
-    def has_flag(self, flag: SourceRebuildFlags | str) -> bool:
-        '''True if the rebuild was requested with the flag'''
-        if isinstance(flag, str):
-            member = get_member(self.flags, flag)
-            return member is not None and bool(self.flags & member)
-        return bool(self.flags & flag)
-
 ###------------------------------------- Source -------------------------------------###
 
+def _rebase(declared: type, base: type) -> type:
+    '''Rebuild `declared` so it inherites from `base`, keeping its body untouched.
+    Prevents a lot of imports for BaseSource subclasses.'''
+    namespace = {key: value for key, value in vars(declared).items() if key not in ('__dict__', '__weakref__')}
+    new = types.new_class(declared.__name__, (base,), exec_body=lambda body: body.update(namespace))
+    for value in namespace.values():
+        if isinstance(value, property):
+            funcs = (value.fget, value.fset, value.fdel)
+        else:
+            funcs = (getattr(value, '__func__', value),)
+        for func in funcs:
+            for cell in getattr(func, '__closure__', None) or ():
+                try:
+                    if cell.cell_contents is declared:
+                        cell.cell_contents = new
+                except ValueError:
+                    pass
+    return new
+
 class BaseSource(abc.ABC):
+    '''
+    A source profile for one game/disc layout. Subclass it and fill in the pieces you need.
+
+    Plain attributes:  display_name, toc_total_entries, rebuild_flags, geometry, hidden_toc_indices,
+                       build_hashes, metadata_path
+    Domain data:       signature (+ signature_offset), required_files, executable_candidates, toc_seed
+                       drive the default matches / validate_filesystem / decode_toc / encode_toc / scramble_toc
+                       (runtime_file_names defaults to required_files | executable_candidates)
+    Must implement:    locate_toc (and any of the defaults above whose scheme differs)
+    Type names:        BaseSource.Flags / .Geometry / .TocEntry, plus names on each component
+
+    Components (nested classes, one instance per source via source.<lowercase name>):
+
+        class Extensions    source.extensions.resolve(node, header)
+        class Packages      source.packages.members(...) / .conflicts(...)
+        class Metadata      source.metadata.build(store)
+        class Patches       source.patches.items / .options / .active(flags) / .locate(handle, nodes)
+                              BasePatch > BasePhysicalPatch / BaseVirtualPatch live here
+        class Builder       source.create_builder(...) -> .build(dst, task_handle)   (optional)
+                              region types live in Builder.Regions
+
+    A source never has to name the base: `class Patches:` is automatically rebuilt to inherit
+    from BaseSource.Patches (or the nearest parent source's Patches). Only `BaseSource` needs importing.
+    '''
     display_name:       ClassVar[str]
     toc_total_entries:  ClassVar[int]
     rebuild_flags:      ClassVar[type[SourceRebuildFlags]]
-    builder:            ClassVar[type[BaseSourceBuilder] | None]
     geometry:           ClassVar[SourceGeometry] = SourceGeometry()
     hidden_toc_indices: ClassVar[frozenset[int]] = frozenset()
     runtime_file_names: ClassVar[frozenset[str]] = frozenset()
     build_hashes:       ClassVar[dict[str, str]] = {}
     metadata_path:      ClassVar[str] = ''
+    builder:            ClassVar[type[BaseSource.Builder] | None] = None  # Set automatically by `Builder`
+
+    signature:             ClassVar[bytes] = b''
+    signature_offset:      ClassVar[int] = 0x28
+    required_files:        ClassVar[frozenset[str]] = frozenset()
+    executable_candidates: ClassVar[frozenset[str]] = frozenset()
+    toc_seed:              ClassVar[int | None] = None
+
+    Flags    = SourceRebuildFlags
+    Geometry = SourceGeometry
+    TocEntry = TocEntry
+
+    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches', 'Builder')
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        '''Make every component a source declares inherit from its base component'''
+        super().__init_subclass__(**kwargs)
+        for attr in ('required_files', 'executable_candidates', 'runtime_file_names'):
+            if attr in cls.__dict__:
+                setattr(cls, attr, frozenset(cls.__dict__[attr]))
+        if not cls.runtime_file_names:
+            cls.runtime_file_names = cls.required_files | cls.executable_candidates
+        for name in BaseSource.COMPONENTS:
+            declared = cls.__dict__.get(name)
+            if declared is None:
+                continue
+            if not isinstance(declared, type):
+                raise TypeError(f'{cls.__name__}.{name} must be a class, got {declared!r}.')
+            base = next(c.__dict__[name] for c in cls.__mro__[1:] if name in c.__dict__)
+            if not issubclass(declared, base):
+                setattr(cls, name, _rebase(declared, base))
+        cls.builder = cls.Builder if cls.Builder is not BaseSource.Builder else None
 
     def __repr__(self) -> str:
-        return f'<{self.__class__.__name__} source_id={getattr(self, "source_id", '?')}>'
+        return f"<{self.__class__.__name__} source_id={getattr(self, 'source_id', '?')}>"
 
-    ### Identificaiton
+    ### Identification
     @abc.abstractmethod
     def matches(self, handle: BlockDevice) -> bool:
         '''Returns True if the signature matches'''
 
-    @abc.abstractmethod
     def validate_filesystem(self, root_children: list[VfsNode]) -> None:
-        '''Raise ValueError if the initial filesystem is invalid'''
+        '''Raise ValueError if the initial filesystem is invalid.
+        Default: every `required_files` and one `executable_candidates`'''
+        found = {child.name for child in root_children}
+        missing = self.required_files - found
+        if missing:
+            raise ValueError(f'Invalid filesystem: missing {sorted(missing)}')
+        if self.executable_candidates and not self.executable_candidates & found:
+            raise ValueError(f'Invalid filesystem: missing an executable, {sorted(self.executable_candidates)}.')
 
     ### Table of contents
     @abc.abstractmethod
@@ -1079,7 +958,8 @@ class BaseSource(abc.ABC):
     ### Tree
     def resolve_boundary(self, root: VfsNode) -> VfsNode:
         '''Return the node that represents the boundary between the VFS and the ISO.
-        Currently only supports a single boundary node.'''
+        Currently only supports a single boundary node.
+        Default: scan the root node's children for `.is_boundary`'''
         if root.children and root.children[-1].is_boundary:
             return root.children[-1]
         for child in root.children:
@@ -1092,48 +972,309 @@ class BaseSource(abc.ABC):
 
     ###-------------------- Components --------------------###
 
-    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches',)
-
-    class Extensions:
-        '''Specify any custom extension resolution logic.'''
+    class Component:
+        '''Base of every per-source component.'''
         def __init__(self, source: BaseSource) -> None:
-            self._source = source
-        def resolve(self, node: VfsNode, header: bytes) ->  str:
+            self.source = source
+        @classmethod
+        def validate(cls, source: type[BaseSource]) -> None:
+            '''Raise at registration if the component is incompletely defined.'''
+
+    class Extensions(Component):
+        '''Specify any custom extension resolution logic.'''
+        def resolve(self, node: VfsNode, header: bytes) -> str:
             '''Return the node's extension from its header bytes.'''
             return '.bin'
 
-    class Packages:
+    class Packages(Component):
         '''Specify any custom package structures.'''
-        def __init__(self, source: BaseSource) -> None:
-            self._source = source
+        Intent     = PackageIntent
+        Member     = PackageMember
+        Finding    = ConflictFinding
+        LinkLookup = LinkLookup
         def members(self, node: VfsNode, intent: PackageIntent, links: LinkLookup) -> tuple[PackageMember, ...]:
             '''Return the members (nodes) that make up a package, or () if not a package.'''
             return ()
         def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[ConflictFinding]:
-            '''Returns the conflicts between the incoming node and the pending nodes.'''
-            return []
+            '''Returns the conflicts between the incoming node and the pending nodes.
+            Default: a node and the node it links with have independent pending edits.'''
+            hid        = incoming.hierarchical_id
+            header_hid = links.link_of(hid)
+            findings: list[ConflictFinding] = []
+            for other in pending:
+                other_hid = other.hierarchical_id
+                if header_hid is not None and other_hid == header_hid:
+                    findings.append(ConflictFinding(other, f'{incoming} depends on header from {other} which has pending modifications'))
+                elif links.link_of(other_hid) == hid:
+                    findings.append(ConflictFinding(other, f'{other} depends on header from {incoming} which has pending modifications'))
+            return findings
 
-    class Metadata:
+    class Metadata(Component):
         '''Specify any custom metadata building logic.'''
-        def __init__(self, source: BaseSource) -> None:
-            self._source = source
+        static_sources: ClassVar[Sequence[Any]] = ()
         def build(self, store: NodeMetadataStore) -> int:
             '''Build a metadata store from scratch.'''
-            return 0
+            return store.ingest_static_sources(self.static_sources) if self.static_sources else 0
 
-    class Patches:
+    class Patches(Component):
         '''Specify any custom patching logic.'''
+        RebuildContext = RebuildContext
+
+        class BasePatch(abc.ABC):
+            '''Overarching base class for all patches.
+            BasePhysicalPatch  patches bytes of a physical file
+            BaseVirtualPatch   patches bytes of a virtual file
+            '''
+            name:         ClassVar[str] = ''
+            description:  ClassVar[str] = ''
+            flag:         ClassVar[SourceRebuildFlags]
+            is_physical:  ClassVar[bool]
+
+            @property
+            def is_virtual(self) -> bool:
+                return not self.is_physical
+
+            @property
+            def is_user_selectable(self) -> bool:
+                '''Currently only return False on NONE (0) flag...'''
+                return bool(self.flag.value)
+
+            def is_active(self, flags: SourceRebuildFlags) -> bool:
+                '''Whether this patch applies for the requested rebuild flags.'''
+                return not self.flag.value or bool(flags & self.flag)
+
+            def check(self, rebuild_flags: type[SourceRebuildFlags]) -> None:
+                '''Raise at registration if the patch is incompletely defined.'''
+                label = type(self).__name__
+                if inspect.isabstract(type(self)):
+                    raise TypeError(f'Patch {label} is abstract. Must implement {sorted(type(self).__abstractmethods__)}')
+                flag = getattr(self, 'flag', None)
+                if not isinstance(flag, rebuild_flags):
+                    raise TypeError(f'Patch {label} flag {flag!r} is not a member of {rebuild_flags.__name__}.')
+                if flag.value and not self.name:
+                    raise TypeError(f'Patch {label}: user selectable patches must define a name.')
+
+        class BasePhysicalPatch(BasePatch):
+            '''
+            Patches bytes of a physical file in place during the rebuild process itself (PhysicalHandler).
+
+            Must implement:
+                candidate_selector(all_nodes)       filter which nodes this patch applies to
+                locate(raw_data)                    find the relative offset of the patch site, or None when it is not present
+                compute_value(context)              calculate the payload to inject
+                apply(data, offset, value)          apply the computed value to the bytearray at offset
+            '''
+            is_physical: ClassVar[bool] = True
+
+            @abc.abstractmethod
+            def candidate_selector(self, all_nodes: list[VfsNode]) -> list[VfsNode]:
+                '''Filter which nodes this patch applies to.'''
+
+            @abc.abstractmethod
+            def locate(self, raw_data: bytes) -> int | None:
+                '''Find the relative offset of the patch site, or None when it is not present.'''
+
+            @abc.abstractmethod
+            def compute_value(self, context: RebuildContext) -> int:
+                '''Calculate the payload to inject.'''
+
+            @abc.abstractmethod
+            def apply(self, data: bytearray, offset: int, value: int) -> None:
+                '''Apply the computed value to the bytearray at offset.'''
+
+        class BaseVirtualPatch(BasePatch):
+            '''
+            Delegated virtual patch. Runs through a Leaf or Container handler `action` on node `hid`.
+
+            Must implement:
+                action      the handler action name
+                hid         hierarchical id of the node to apply the patch to
+            '''
+            is_physical: ClassVar[bool] = False
+            action:      ClassVar[str]
+            hid:         ClassVar[tuple[int, ...]]
+
+            def check(self, rebuild_flags: type[SourceRebuildFlags]) -> None:
+                super().check(rebuild_flags)
+                if not (hasattr(self, 'action') and hasattr(self, 'hid')):
+                    raise TypeError(f'{type(self).__name__}: delegated patches must define both `action` and `hid`.')
+
         items: ClassVar[tuple[BasePatch, ...]] = ()
-        def __init__(self, source: BaseSource) -> None:
-            self._source = source
+
+        def __init_subclass__(cls, **kwargs: Any) -> None:
+            super().__init_subclass__(**kwargs)
+            if 'items' in cls.__dict__:  # accept patch classes as well as instances
+                cls.items = tuple(p() if isinstance(p, type) else p for p in cls.items)
+
         @property
         def options(self) -> tuple[BasePatch, ...]:
             '''Exposes all user-selectable patches to the UI for the source.'''
-            return tuple(selectable_patches(self.items))
+            return tuple(patch for patch in self.items if patch.is_user_selectable)
+
         def active(self, flags: SourceRebuildFlags) -> list[BasePatch]:
             '''Patches active for a rebuild with these flags. (NONE is always active)'''
             return [patch for patch in self.items if patch.is_active(flags)]
 
+        def get(self, name: str) -> BasePatch | None:
+            return next((patch for patch in self.items if patch.name == name), None)
+
+        class Plan:
+            '''
+            Where the active physical patches apply on one disk. The Builder only sees this narrow surface:
+
+                covers(node)                does any active physical patch apply to this node
+                patcher(node, context)      callable that edits the node's bytes in place when written
+                describe(node)              (patch name, offset) pairs, for diagnostics
+
+            Patch sites are located lazily, against the bytes that will be written, and never leave the plan.
+            '''
+            def __init__(self, patches: BaseSource.Patches, handle: BlockDevice, flags: SourceRebuildFlags) -> None:
+                self._handle = handle
+                self.active  = tuple(patch for patch in patches.active(flags) if patches.is_physical)
+
+            def _raw(self, node: VfsNode) -> bytes:
+                return node.pending_data if node.pending_data is not None else self._handle.pread(node.offset, node.size)
+
+            def _sites(self, node: VfsNode, raw: bytes | None = None) -> list[tuple[BasePhysicalPatch, int]]:
+                selected = [patch for patch in self.active if node in patch.candidate_selector([node])]
+                if not selected:
+                    return []
+                raw = self._raw(node) if raw is None else raw
+                found = ((patch, patch.locate(raw)) for patch in selected)
+                return [(patch, offset) for patch, offset in found if offset is not None]
+
+            def covers(self, node: VfsNode) -> bool:
+                return bool(self._sites(node))
+
+            def describe(self, node: VfsNode) -> list[tuple[str, int]]:
+                return [(type(patch).__name__, offset) for patch, offset in self._sites(node)]
+
+            def patcher(self, node: VfsNode, context: RebuildContext) -> Callable[[bytearray], None] | None:
+                def apply(data: bytearray) -> None:
+                    for patch, offset in self._sites(node, bytes(data)):
+                        patch.apply(data, offset, patch.compute_value(context))
+                return apply
+
+        def plan(self, handle: BlockDevice, flags: SourceRebuildFlags) -> Plan:
+            '''Resolve the physical patches active for the `flags` against the physical source'''
+            return self.Plan(self, handle, flags)
+
+        @classmethod
+        def validate(cls, source: type[BaseSource]) -> None:
+            seen: set[str] = set()
+            for patch in cls.items:
+                if not isinstance(patch, cls.BasePatch):
+                    raise TypeError(f'{source.__name__}.Patches.items must hold BasePatch instances, got {patch!r}')
+                patch.check(source.rebuild_flags)
+                if patch.name:
+                    if patch.name in seen:
+                        raise ValueError(f'{source.__name__} has more than one patch with name, {patch.name!r}')
+                    seen.add(patch.name)
+
+    class Builder(abc.ABC):
+        '''
+        Plans and writes a rebuilt source. A source declares `class Builder:`; create it with
+        source.create_builder(...).
+
+        Must Implement:
+            build_layout()              add every region front to back with add_region()
+
+        Entrypoint (do not override):
+            build(dist, task_handle)    build_layout() > resolve_offsets() > write_all(), return bytes_written
+
+        Available to build_layout:
+            source, geometry, handle, source_root, vfs_root, staged, flags, toc, pvd, gap_nodes
+            patch_plan / patches_for(node)  active patches
+            rebuild_context / lba_of(name)  named regions, readable by patches
+            has_flag(flag)                  was the rebuild requested with this flag
+            Regions                         region types, e.g. self.Regions.RawCopy(...)
+            log(message)                    progress message to the UI
+        '''
+        class Regions:
+            '''Region types a layout is built from. Aliased so builders don't need to import a bunch of classes.'''
+            Region        = DiskRegion
+            RawCopy       = RawCopyRegion
+            StagedData    = StagedDataRegion
+            ZeroFill      = ZeroFillRegion
+            Align         = AlignRegion
+            PadToLba      = PadToLbaRegion
+            Sentinel      = SentinelRegion
+            Toc           = TocRegion
+            RootDirectory = RootDirectoryRegion
+            BinaryPatch   = BinaryPatchRegion
+
+        def __init__(
+            self,
+            *,
+            source:      BaseSource,
+            handle:      BlockDevice,
+            source_root: VfsNode,
+            vfs_root:    VfsNode,
+            staged:      frozenset[VfsNode],
+            flags:       SourceRebuildFlags,
+            toc:         list[TocEntry],
+            pvd:         RootDirectoryStructure,
+            gap_nodes:   list[VfsNode],
+            log:         Callable[[str], None] | None = None,
+        ) -> None:
+            self.source      = source
+            self.geometry    = source.geometry
+            self.handle      = handle
+            self.source_root = source_root
+            self.vfs_root    = vfs_root
+            self.staged      = staged
+            self.flags       = flags
+            self.toc         = toc
+            self.pvd         = pvd
+            self.gap_nodes   = gap_nodes
+            self.log         = log or (lambda message: None)
+
+            self.planner: DiskLayoutPlanner = DiskLayoutPlanner()
+            self.named:   dict[str, DiskRegion] = {}
+            self.rebuild_context = RebuildContext(regions=self.named, sector_size=self.geometry.sector_size)
+
+            self.patch_plan = source.patches.plan(handle, flags)
+
+        ### Contract
+        @abc.abstractmethod
+        def build_layout(self) -> None:
+            '''subclasses must implement this method to build the layout, by calling self.add_region() sequentially'''
+
+        ### Entrypoint
+        def build(self, dst: BinaryIO, task_handle: TaskHandle, progress_every: int = 1) -> int:
+            '''Plan, resolve and write a new source. Returns the number of bytes written.'''
+            self.build_layout()
+            self.log(f'Resolving physical disk layout offsets for {len(self.planner.regions)} regions')
+            self.planner.resolve_offsets()
+            self.log('Starting sequential write...')
+            return self.planner.write_all(dst, task_handle, progress_every)
+
+        ### Helpers
+        def add_region(self, region: DiskRegion, name: str | None = None, alignment: int | None = None) -> DiskRegion:
+            '''Append a region, keyed by name.'''
+            if name is not None:
+                if name in self.named:
+                    raise ValueError(f'Layout already defines a region for name {name!r}')
+                self.named[name] = region
+            return self.planner.add(region, alignment=alignment)
+
+        def lba_of(self, name: str) -> int:
+            return self.rebuild_context.lba_of(name)
+
+        def patcher_for(self, node: VfsNode) -> Callable[[bytearray], None] | None:
+            '''Byte patcher for the node.'''
+            if not self.patch_plan.covers(node):
+                return None
+            return self.patch_plan.patcher(node, self.rebuild_context)
+
+        def has_flag(self, flag: SourceRebuildFlags | str) -> bool:
+            '''True if rebuild was requested with the flag'''
+            if isinstance(flag, str):
+                member = get_member(self.flags, flag)
+                return member is not None and bool(self.flags & member)
+            return bool(self.flags & flag)
+
+    ### Component Access
     @cached_property
     def extensions(self) -> Extensions:
         return self.Extensions(self)
@@ -1150,51 +1291,40 @@ class BaseSource(abc.ABC):
     def patches(self) -> Patches:
         return self.Patches(self)
 
+    def create_builder(self, **kwargs: Any) -> Builder:
+        '''Instantiate this source's Builder'''
+        if self.builder is None:
+            raise NotImplementedError(f'{self.__class__.__name__} does not define a Builder.')
+        return self.builder(source=self, **kwargs)
+
     ### Registration check
     @classmethod
     def validate_definition(cls) -> None:
         '''Raise early (at startup, from Registry.register_source) if the source is incompletely defined.'''
         name = cls.__name__
-        if not isinstance(cls.hidden_toc_indices, frozenset):
-            raise TypeError(
-                f"[{cls.__name__}] 'hidden_toc_indices' must be a frozenset "
-                f"to prevent cross-rebuild state mutation."
-            )
-        if not isinstance(cls.runtime_file_names, frozenset):
-            raise TypeError(
-                f"[{cls.__name__}] 'runtime_file_names' must be a frozenset "
-                f"to prevent cross-rebuild state mutation."
-            )
-        for attr in ('display_name', 'toc_total_entries', 'rebuild_flags', 'builder'):
+        for attr in ('hidden_toc_indices', 'runtime_file_names'):
+            if not isinstance(getattr(cls, attr), frozenset):
+                raise TypeError(f"[{name}] '{attr}' must be a frozenset to prevent cross-rebuild state mutation.")
+        for attr in ('display_name', 'toc_total_entries', 'rebuild_flags'):
             if not hasattr(cls, attr):
                 raise TypeError(f'{name} must define `{attr}`.')
         if inspect.isabstract(cls):
             raise TypeError(f'{name} is abstract; implement {sorted(cls.__abstractmethods__)}.')
+        if cls.matches is BaseSource.matches and not cls.signature:
+            raise TypeError(f'{name} must define `signature` (or override matches()).')
         none_flag = cls.rebuild_flags.__members__.get('NONE')
         if none_flag is None or none_flag.value != 0:
             raise TypeError(f'{name}.rebuild_flags must define NONE = 0 (the no-patch flag).')
-        # if not (isinstance(cls.builder, type) and issubclass(cls.builder, BaseSourceBuilder)):
-        #     raise TypeError(f'{name}.builder must be a BaseSourceBuilder subclass (the class, not an instance).')
-        # if inspect.isabstract(cls.builder):
-        #     raise TypeError(f'{name}.builder {cls.builder.__name__} is abstract; implement {sorted(cls.builder.__abstractmethods__)}.')
+        for attr in ('extensions', 'packages', 'metadata', 'patches'):
+            if not isinstance(inspect.getattr_static(cls, attr), cached_property):
+                raise TypeError(f'{name}.{attr} is reserved for the component instance; declare `class {attr.capitalize()}:` instead.')
         for attr in BaseSource.COMPONENTS:
             base      = getattr(BaseSource, attr)
-            component = getattr(cls, attr, None)
-            if component is base:
-                raise TypeError(
-                    f'{name} must specify its own `{attr}` component. Add this to the class body:\n'
-                    f'    class {attr}(BaseSource.{attr}): ...'
-                )
+            component = getattr(cls, attr)
             if not (isinstance(component, type) and issubclass(component, base)):
                 raise TypeError(f'{name}.{attr} must be a class that subclasses BaseSource.{attr}, got {component!r}.')
-        seen: set[str] = set()
-        for patch in cls.Patches.items:
-            if not isinstance(patch, BasePatch):
-                raise TypeError(f'{name}.Patches.items must hold BasePatch instances, got {patch!r}.')
-            if inspect.isabstract(type(patch)):
-                raise TypeError(f'Patch {type(patch).__name__} is abstract; implement {sorted(type(patch).__abstractmethods__)}.')
-            if not isinstance(patch.flag, cls.rebuild_flags):
-                raise TypeError(f'Patch {patch.name!r} flag {patch.flag!r} is not a member of {cls.rebuild_flags.__name__}.')
-            if patch.name in seen:
-                raise ValueError(f'{cls.__name__} has more than one patch with name, {patch.name!r}.')
-            seen.add(patch.name)
+            if attr == 'Builder':
+                if component is not base and inspect.isabstract(component):
+                    raise TypeError(f'{name}.Builder is abstract; implement {sorted(component.__abstractmethods__)}.')
+            else:
+                component.validate(cls)
