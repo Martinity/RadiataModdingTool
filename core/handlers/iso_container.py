@@ -14,10 +14,7 @@ from core.node import VfsNode
 from core.registry import Registry, FormatResolver
 from core.workers import TaskHandle
 from core.native.block_device import BlockDevice
-from core.contracts import (
-    BaseSource, SourceGeometry, TocEntry, PatchLocator, PatchSite, SourceRebuildFlags,
-    RootDirectoryStructure, PhysicalHandler
-)
+from core.contracts import BaseSource, PhysicalHandler, TocEntry, RootDirectoryStructure, SourceRebuildFlags
 
 logger = logging.getLogger(f'radiata.{__name__}')
 
@@ -36,10 +33,9 @@ class SourceHandler(PhysicalHandler):
         super().__init__(handle, parent_node=parent)
         logger.info(f'SourceHandler initialized for {handle.name}')
         self.source:         BaseSource = source or resolver.detect_source(handle)
-        self.geometry:       SourceGeometry = self.source.geometry
+        self.geometry:       BaseSource.Geometry = self.source.geometry
         self.toc:            list[TocEntry]  = []
         self.toc_lba:        int = -1
-        self.patch_targets:  list[PatchSite] = []
         self.pvd:            RootDirectoryStructure | None = None
         self.cnf:            tuple[int, int] | None = None
         self.system_areas:   VfsNode = VfsNode()
@@ -165,13 +161,9 @@ class SourceHandler(PhysicalHandler):
         Dynamically locate the TOC offset and process the TOC data.
         """
         source_root = self._get_iso_dir()
-        slus_node = [node for node in source_root.children if node.name.startswith(('SLUS', 'SLPM'))]
-        if not slus_node:
-            raise ValueError('No SLUS/SLPM node found in ISO root')
         self.toc_lba = self.source.locate_toc(source_root, self.handle)
         self.toc = self.source.decode_toc(self.handle, self.toc_lba)
         self._get_vfs_dir(self.toc)
-        self.patch_targets = PatchLocator().locate_all(self.handle, source_root.children, self.source.patches)
         return source_root
 
     ###----------------------------------- Build ISO ------------------------------------------###
@@ -199,9 +191,7 @@ class SourceHandler(PhysicalHandler):
             raise ValueError('PVD not found')
         vfs_root = self.source.resolve_boundary(root)
         try:
-            if self.source.builder is None:
-                raise NotImplementedError('No builder defined for source')
-            builder = self.source.builder(
+            builder = self.source.create_builder(
                 source=self.source,
                 handle=self.handle,
                 source_root=root,
@@ -209,7 +199,6 @@ class SourceHandler(PhysicalHandler):
                 staged=frozenset(staged_nodes),
                 flags=build_flags,
                 toc=self.toc,
-                patch_sites=self.patch_targets,
                 pvd=self.pvd,
                 gap_nodes=list(self.system_areas.children[2:]),
                 log=task_handle.log_message.emit

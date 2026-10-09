@@ -36,10 +36,10 @@ from typing import Callable, TYPE_CHECKING, Iterator
 from contextlib import contextmanager
 from core.node import VfsNode, VfsManager
 from core.registry import Registry
-from core.contracts import ContainerHandler, LeafHandler, ResolvedPackage, PackageError, as_package_result, PackageIntent, BaseSource
+from core.contracts import ContainerHandler, LeafHandler, ResolvedPackage, PackageError, as_package_result, BaseSource
 if TYPE_CHECKING:
     from core.workers import TaskHandle
-    from core.contracts import BaseHandler, PackageMember, LinkLookup
+    from core.contracts import BaseHandler
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -69,7 +69,7 @@ class VfsNavigator:
             expansion_callback:  Callable[[VfsNode, threading.Event], None],
             ghost_node_callback: Callable[[tuple[int, ...]], None] | None = None,
             source_profile:      BaseSource | None = None,
-            links:               LinkLookup | None = None,
+            links:               BaseSource.Packages.LinkLookup | None = None,
         ):
         self.vfs  = vfs
         self.read = data_reader
@@ -224,13 +224,13 @@ class VfsNavigator:
 
     ###---------------------------------- Packages ----------------------------------###
 
-    def package_members(self, node: VfsNode, intent: PackageIntent = PackageIntent.ACCESS) -> tuple[PackageMember, ...]:
+    def package_members(self, node: VfsNode, intent: BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS) -> tuple[BaseSource.Packages.Member, ...]:
         '''What the active source says node's handler needs.'''
         if self._source_profile is None or self._links is None:
             return ()
-        return self._source_profile.members_for(node, intent, self._links)
+        return self._source_profile.packages.members(node, intent, self._links)
 
-    def ensure_package(self, node: VfsNode, intent: PackageIntent, on_ready: Callable[[], None]) -> None:
+    def ensure_package(self, node: VfsNode, intent: BaseSource.Packages.Intent, on_ready: Callable[[], None]) -> None:
         '''Ensure the package for the given node is ready, calling on_ready when done.'''
         pending = [m.hid for m in self.package_members(node, intent) if m.required]
         def _next(_: VfsNode | None = None) -> None:
@@ -242,7 +242,7 @@ class VfsNavigator:
             self.resolve_ghost_node(pending[0], _next)
         _next()
 
-    def resolve_package(self, node: VfsNode, intent: PackageIntent = PackageIntent.ACCESS) -> ResolvedPackage | None:
+    def resolve_package(self, node: VfsNode, intent: BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS) -> ResolvedPackage | None:
         '''Collect all the package's required members and their bytes, blocking until ready'''
         specs = self.package_members(node, intent)
         if not specs:
@@ -272,7 +272,7 @@ class VfsNavigator:
         node:          VfsNode,
         task_handle:   TaskHandle,
         raw_bytes:     bytes,
-        intent:        PackageIntent = PackageIntent.ACCESS,
+        intent:        BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS,
     ) -> Iterator[BaseHandler]:
         '''Construct a handler injecting task_handle and package data.'''
         if not issubclass(handler_class, (ContainerHandler, LeafHandler)):

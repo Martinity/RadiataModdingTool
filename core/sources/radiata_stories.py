@@ -10,24 +10,17 @@ from struct import unpack_from
 from enum import auto
 
 from core.registry import Registry
-from core.contracts import (
-    SourceGeometry, TocEntry, RebuildContext, SourceRebuildFlags, ConflictFinding,
-    PackageIntent, PackageMember, BasePhysicalPatch, BaseVirtualPatch, BaseSource,
-    BaseSourceBuilder, RawCopyRegion, StagedDataRegion, AlignRegion, PadToLbaRegion,
-    SentinelRegion, TocRegion, RootDirectoryRegion, BinaryPatchRegion, PatchLocator,
-    PatchSite
-)
+from core.contracts import BaseSource
 from core.iso_layout import IsoSourceBuilder
 from core.handlers.kods_container import HEADER_ROLE, slot_header_role
 from core.extension_overrides import lookup_extension
 from core.node import VfsNode
 
 if TYPE_CHECKING:
-    from core.metadata_manager import NodeMetadataStore, StaticMetadataSource
+    from core.metadata_manager import StaticMetadataSource
     from core.native.block_device import BlockDevice
-    from core.contracts import LinkLookup
 
-_GEOMETRY = SourceGeometry(sector_size=0x800, iso_9660_pvd=16, pvd_byte_offset=0x9C)
+_GEOMETRY = BaseSource.Geometry(sector_size=0x800, iso_9660_pvd=16, pvd_byte_offset=0x9C)
 _RUNTIME_REQUIRED_FILES = {'IOPRP300', 'SYSTEM'}
 _RUNTIME_EXECUTABLE_CANDIDATES = {'SLUS_212', 'SLPM_658'}
 

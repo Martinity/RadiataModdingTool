@@ -8,12 +8,10 @@ Contract map:
     Sources     BaseSource
                   .Extensions         source.extensions.resolve(node, header)
                   .Packages           source.packages.members(...) / .conflicts(...)
-                  .Metadata           source.metadata.build(store)
-                  .Patches            source.patches.items / .options / .active(flags) / .locate(...)
+                  .Metadata           source.metadata.path / .entries() / .audit() / .build(store)
+                  .Patches            source.patches.items / .options / .active(flags) / .plan(handle, flags)
                                         .BasePatch > .BasePhysicalPatch / .BaseVirtualPatch
-                  .Builder            source.create_builder(...) (.Regions)
-
-BaseSources components automatically inherit from the matching class.
+                  .Builder            source.create_builder(...) (.Regions the region type)
 '''
 from __future__ import annotations
 
@@ -23,13 +21,13 @@ import array
 import inspect
 import struct
 import sys
-import types
+import re
 from functools import cached_property
 from dataclasses import dataclass, field
 from enum import Flag, Enum, auto
 from pathlib import Path
 from typing import (
-    Any, Callable, NamedTuple, TYPE_CHECKING, runtime_checkable, BinaryIO, Protocol,
+    Any, AbstractSet, Callable, cast, Iterator, NamedTuple, TYPE_CHECKING, TypeAlias, runtime_checkable, BinaryIO, Protocol,
     ClassVar, Sequence
 )
 from PyQt6.QtWidgets import QWidget
@@ -437,31 +435,6 @@ def get_member(flags: SourceRebuildFlags, name: str) -> SourceRebuildFlags | Non
     '''Lookup a flag by name for a source without importing specific flags'''
     return type(flags).__members__.get(name)
 
-###----------------------------------- Package & Conflict Detection ---------------------------------------###
-
-class PackageIntent(Enum):
-    '''What actions a package needs to perform.'''
-    ACCESS = auto()
-    IMPORT = auto()
-
-@dataclass(frozen=True, slots=True)
-class PackageMember:
-    '''A single required member (node) of a package.'''
-    role:     str
-    hid:      tuple[int, ...]
-    required: bool = True
-
-@runtime_checkable
-class LinkLookup(Protocol):
-    '''Resolves links for a package, satisfied by NodeMetadataStore.'''
-    def link_of(self, hid: tuple[int, ...]) -> tuple[int, ...] | None: ...
-
-@dataclass(frozen=True, slots=True)
-class ConflictFinding:
-    '''One source-defined filesystem conflict, resolved by ModTracker.'''
-    other:  VfsNode
-    reason: str
-
 ###-------------------------------------- ISO Structs ---------------------------------------###
 
 def pack_both_endian_32(val):
@@ -696,7 +669,7 @@ class RootDirectoryRegion(DiskRegion):
             entry_length = self.original_bytes[bytes_read]
             if not entry_length:
                 output.append(0)
-                bytes_read += 1
+                bytes_read += self.fixed_size
                 continue
             record_slice = bytearray(self.original_bytes[bytes_read : bytes_read + entry_length])
             record = RootDirectoryStructure.from_bytes(bytes(record_slice), self.sector_size)
@@ -728,11 +701,10 @@ class BinaryPatchRegion(DiskRegion):
     '''
     Special case for a region that needs to be mutated during the rebuild process.
     '''
-    node:            VfsNode
-    src_handle:      BlockDevice
-    sector_size:     int
-    patch_targets:   list[PatchSite] = field(default_factory=list)
-    rebuild_context: RebuildContext | None = None
+    node:        VfsNode
+    src_handle:  BlockDevice
+    sector_size: int
+    patcher:     Callable[[bytearray], None] | None = None
     @property
     def size(self) -> int:
         if self.node.pending_data is not None:
@@ -747,10 +719,8 @@ class BinaryPatchRegion(DiskRegion):
             data = bytearray(self.node.size)
             if self.node.size != self.src_handle.readinto(data, self.node.offset):
                 raise ValueError(f'Expected {self.node.size} bytes, got {len(data)}')
-        if self.rebuild_context is not None:
-            for site in self.patch_targets:
-                value = site.patch.compute_value(self.rebuild_context)
-                site.patch.apply(data, site.relative_offset, value)
+        if self.patcher is not None:
+            self.patcher(data)
         dst.write(data)
         return len(data)
 
@@ -835,25 +805,6 @@ class DiskLayoutPlanner:
 
 ###------------------------------------- Source -------------------------------------###
 
-def _rebase(declared: type, base: type) -> type:
-    '''Rebuild `declared` so it inherites from `base`, keeping its body untouched.
-    Prevents a lot of imports for BaseSource subclasses.'''
-    namespace = {key: value for key, value in vars(declared).items() if key not in ('__dict__', '__weakref__')}
-    new = types.new_class(declared.__name__, (base,), exec_body=lambda body: body.update(namespace))
-    for value in namespace.values():
-        if isinstance(value, property):
-            funcs = (value.fget, value.fset, value.fdel)
-        else:
-            funcs = (getattr(value, '__func__', value),)
-        for func in funcs:
-            for cell in getattr(func, '__closure__', None) or ():
-                try:
-                    if cell.cell_contents is declared:
-                        cell.cell_contents = new
-                except ValueError:
-                    pass
-    return new
-
 class BaseSource(abc.ABC):
     '''
     A source profile for one game/disc layout. Subclass it and fill in the pieces you need.
@@ -871,13 +822,10 @@ class BaseSource(abc.ABC):
         class Extensions    source.extensions.resolve(node, header)
         class Packages      source.packages.members(...) / .conflicts(...)
         class Metadata      source.metadata.build(store)
-        class Patches       source.patches.items / .options / .active(flags) / .locate(handle, nodes)
+        class Patches       source.patches.all_patches / .options / .active(flags) / .plan(handle, flags)
                               BasePatch > BasePhysicalPatch / BaseVirtualPatch live here
         class Builder       source.create_builder(...) -> .build(dst, task_handle)   (optional)
                               region types live in Builder.Regions
-
-    A source never has to name the base: `class Patches:` is automatically rebuilt to inherit
-    from BaseSource.Patches (or the nearest parent source's Patches). Only `BaseSource` needs importing.
     '''
     display_name:       ClassVar[str]
     toc_total_entries:  ClassVar[int]
@@ -891,34 +839,33 @@ class BaseSource(abc.ABC):
 
     signature:             ClassVar[bytes] = b''
     signature_offset:      ClassVar[int] = 0x28
-    required_files:        ClassVar[frozenset[str]] = frozenset()
-    executable_candidates: ClassVar[frozenset[str]] = frozenset()
-    toc_seed:              ClassVar[int | None] = None
+    required_files:        ClassVar[AbstractSet[str]] = frozenset()  # root files that must all exist
+    executable_candidates: ClassVar[AbstractSet[str]] = frozenset()  # root files, at least one must exist
+    toc_seed:              ClassVar[int | None] = None      # XOR scramble seed; None = plain TOC
 
-    Flags    = SourceRebuildFlags
-    Geometry = SourceGeometry
-    TocEntry = TocEntry
+    # Names for the types a source needs, so a source module only imports BaseSource
+    Flags:    TypeAlias = SourceRebuildFlags
+    Geometry: TypeAlias = SourceGeometry
+    TocEntry: TypeAlias = TocEntry
 
     COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches', 'Builder')
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        '''Make every component a source declares inherit from its base component'''
+        '''Validate and derive the components a source declares'''
         super().__init_subclass__(**kwargs)
+        if 'metadata_path' in cls.__dict__:
+            raise TypeError(f'{cls.__name__}: move `metadata_path` into the component: `class Metadata:  path = ...`')
         for attr in ('required_files', 'executable_candidates', 'runtime_file_names'):
             if attr in cls.__dict__:
                 setattr(cls, attr, frozenset(cls.__dict__[attr]))
         if not cls.runtime_file_names:
-            cls.runtime_file_names = cls.required_files | cls.executable_candidates
+            cls.runtime_file_names = frozenset(cls.required_files | cls.executable_candidates)
         for name in BaseSource.COMPONENTS:
             declared = cls.__dict__.get(name)
-            if declared is None:
-                continue
-            if not isinstance(declared, type):
-                raise TypeError(f'{cls.__name__}.{name} must be a class, got {declared!r}.')
-            base = next(c.__dict__[name] for c in cls.__mro__[1:] if name in c.__dict__)
-            if not issubclass(declared, base):
-                setattr(cls, name, _rebase(declared, base))
+            if declared is not None and not (isinstance(declared, type) and issubclass(declared, getattr(BaseSource, name))):
+                raise TypeError(f'{cls.__name__}.{name} must subclass BaseSource.{name}: write `class {name}(BaseSource.{name}):`.')
         cls.builder = cls.Builder if cls.Builder is not BaseSource.Builder else None
+        cls.metadata_path = cls.Metadata.path
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} source_id={getattr(self, 'source_id', '?')}>"
@@ -988,37 +935,152 @@ class BaseSource(abc.ABC):
 
     class Packages(Component):
         '''Specify any custom package structures.'''
-        Intent     = PackageIntent
-        Member     = PackageMember
-        Finding    = ConflictFinding
-        LinkLookup = LinkLookup
-        def members(self, node: VfsNode, intent: PackageIntent, links: LinkLookup) -> tuple[PackageMember, ...]:
+        class Intent(Enum):
+            '''What a package resolution is for'''
+            ACCESS = auto()
+            IMPORT = auto()
+        @dataclass(frozen=True, slots=True)
+        class Member:
+            '''A single reguired node of a package'''
+            role:     str
+            hid:      tuple[int, ...]
+            required: bool = True
+        @runtime_checkable
+        class LinkLookup(Protocol):
+            '''Resolves links between nodes required to resolve a package
+            Satisfied by metadata.'''
+            def link_of(self, hid: tuple[int, ...]) -> tuple[int, ...] | None: ...
+        @dataclass(frozen=True, slots=True)
+        class Finding:
+            '''One source-defined filesystem conflic.
+            Resolved by ModTracker.'''
+            other:  VfsNode
+            reason: str
+
+        def members(self, node: VfsNode, intent: Intent, links: LinkLookup) -> tuple[Member, ...]:
             '''Return the members (nodes) that make up a package, or () if not a package.'''
             return ()
-        def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[ConflictFinding]:
+        def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[Finding]:
             '''Returns the conflicts between the incoming node and the pending nodes.
             Default: a node and the node it links with have independent pending edits.'''
             hid        = incoming.hierarchical_id
             header_hid = links.link_of(hid)
-            findings: list[ConflictFinding] = []
+            findings: list[BaseSource.Packages.Finding] = []
             for other in pending:
                 other_hid = other.hierarchical_id
                 if header_hid is not None and other_hid == header_hid:
-                    findings.append(ConflictFinding(other, f'{incoming} depends on header from {other} which has pending modifications'))
+                    findings.append(self.Finding(other, f'{incoming} depends on header from {other} which has pending modifications'))
                 elif links.link_of(other_hid) == hid:
-                    findings.append(ConflictFinding(other, f'{other} depends on header from {incoming} which has pending modifications'))
+                    findings.append(self.Finding(other, f'{other} depends on header from {incoming} which has pending modifications'))
             return findings
 
     class Metadata(Component):
-        '''Specify any custom metadata building logic.'''
+        '''
+        Everything metadata for the source: where the json lives, and the entries used to build it from scatch.
+
+            path            resource path of the metadata json
+            static_sources  StaticMetadataSource classes, ingested in order
+            entries()       override (extend with super().entries()) to contribute more entries
+        '''
+        FIELDS: ClassVar[frozenset[str]] = frozenset({'title', 'description', 'tags', 'target', 'extension'})
+        _HID = re.compile(r'\d+(\.\d+)*')
+
+        path:           ClassVar[str] = ''
         static_sources: ClassVar[Sequence[Any]] = ()
+
+        class Report:
+            '''Outcome of running the ingestion pipeline. errors are skipped entries, warnings are order-dependent overwrites.'''
+            def __init__(self) -> None:
+                self.count:    int = 0
+                self.errors:   list[str] = []
+                self.warnings: list[str] = []
+
+        def entries(self) -> Iterator[tuple[str, dict[str, Any]]]:
+            '''Every (hid, fields) this source contributes. Default: `static_sources` in order.'''
+            for static in self.static_sources:
+                yield from static.iter_entries()
+
+        @classmethod
+        def check_entry(cls, hid: Any, fields: Any) -> str | None:
+            '''Return what is wrong with one entry, or None.'''
+            if not isinstance(hid, str) or not cls._HID.fullmatch(hid):
+                return f'hid {hid!r} is not dotted integers'
+            if not isinstance(fields, dict):
+                return f'{hid}: fields must be a dict, got {type(fields).__name__}'
+            if unknown := set(fields) - cls.FIELDS:
+                return f'{hid}: unknown field(s) {sorted(unknown)}'
+            for key in ('title', 'description'):
+                if fields.get(key) is not None and not isinstance(fields[key], str):
+                    return f'{hid}: {key} must be str, got {fields[key]!r}'
+            tags = fields.get('tags')
+            if tags is not None and not (isinstance(tags, (list, tuple)) and all(isinstance(t, str) and t for t in tags)):
+                return f'{hid}: tags must be a list/tuple of non-empty str, got {tags!r}'
+            target = fields.get('target')
+            if target is not None and not (isinstance(target, (list, tuple)) and target and all(isinstance(i, int) for i in target)):
+                return f'{hid}: target must be a non-empty tuple of int, got {target!r}'
+            ext = fields.get('extension')
+            if ext is not None and not (isinstance(ext, str) and ext.startswith('.') and len(ext) > 1):
+                return f'{hid}: extension must look like ".ext", got {ext!r}'
+            return None
+
+        def _screen(self, entries: Iterator[tuple[str, dict[str, Any]]], report: BaseSource.Metadata.Report) -> Iterator[tuple[str, dict[str, Any]]]:
+            '''Yield only valid entries, recording invalid ones and conflicting overwrites in `report`.'''
+            seen: dict[str, dict[str, Any]] = {}
+            for hid, fields in entries:
+                problem = self.check_entry(hid, fields)
+                if problem:
+                    report.errors.append(problem)
+                    continue
+                prior = seen.setdefault(hid, {})
+                for key in ('title', 'description', 'target', 'extension'):  # tags merge, the rest overwrite
+                    new = fields.get(key)
+                    if new is None:
+                        continue
+                    if key in prior and prior[key] != new:
+                        report.warnings.append(f'{hid}: {key} overwritten ({prior[key]!r} -> {new!r})')
+                    prior[key] = new
+                report.count += 1
+                yield hid, fields
+
+        def audit(self) -> BaseSource.Metadata.Report:
+            '''Dry-run the ingestion pipeline without a store.'''
+            report = self.Report()
+            for _ in self._screen(self.entries(), report):
+                pass
+            return report
+
         def build(self, store: NodeMetadataStore) -> int:
-            '''Build a metadata store from scratch.'''
-            return store.ingest_static_sources(self.static_sources) if self.static_sources else 0
+            '''Build a metadata store from scratch through the checked pipeline. Invalid entries are skipped and logged.'''
+            report = self.Report()
+            count = store.register_many(self._screen(self.entries(), report))
+            for line in report.errors[:20]:
+                logger.error(f'{self.source.__class__.__name__} metadata: skipped {line}')
+            if report.warnings:
+                logger.warning(f'{self.source.__class__.__name__} metadata: {len(report.warnings)} overwritten field(s), first: {report.warnings[0]}')
+            return count
+
+        @classmethod
+        def validate(cls, source: type[BaseSource]) -> None:
+            name = source.__name__
+            if cls.path and not cls.path.endswith('.json'):
+                raise TypeError(f'{name}.Metadata.path must be a .json path, got {cls.path!r}.')
+            for static in cls.static_sources:
+                if not callable(getattr(static, 'iter_entries', None)):
+                    raise TypeError(f'{name}.Metadata.static_sources: {static!r} has no iter_entries().')
+            report = cls(source()).audit()
+            if report.count and not cls.path:
+                raise TypeError(f'{name}.Metadata produces {report.count} entries but defines no `path`.')
+            if report.errors:
+                raise ValueError(
+                    f'{name}.Metadata ingestion has {len(report.errors)} invalid entr{"y" if len(report.errors) == 1 else "ies"}, '
+                    f'first: {"; ".join(report.errors[:5])}'
+                )
+            if report.warnings:
+                logger.warning(f'{name}.Metadata: {len(report.warnings)} field(s) overwritten by a later source, first: {report.warnings[0]}')
 
     class Patches(Component):
         '''Specify any custom patching logic.'''
-        RebuildContext = RebuildContext
+        RebuildContext: TypeAlias = RebuildContext
 
         class BasePatch(abc.ABC):
             '''Overarching base class for all patches.
@@ -1046,8 +1108,6 @@ class BaseSource(abc.ABC):
             def check(self, rebuild_flags: type[SourceRebuildFlags]) -> None:
                 '''Raise at registration if the patch is incompletely defined.'''
                 label = type(self).__name__
-                if inspect.isabstract(type(self)):
-                    raise TypeError(f'Patch {label} is abstract. Must implement {sorted(type(self).__abstractmethods__)}')
                 flag = getattr(self, 'flag', None)
                 if not isinstance(flag, rebuild_flags):
                     raise TypeError(f'Patch {label} flag {flag!r} is not a member of {rebuild_flags.__name__}.')
@@ -1099,24 +1159,24 @@ class BaseSource(abc.ABC):
                 if not (hasattr(self, 'action') and hasattr(self, 'hid')):
                     raise TypeError(f'{type(self).__name__}: delegated patches must define both `action` and `hid`.')
 
-        items: ClassVar[tuple[BasePatch, ...]] = ()
+        all_patches: ClassVar[tuple[BasePatch, ...]] = ()
 
         def __init_subclass__(cls, **kwargs: Any) -> None:
             super().__init_subclass__(**kwargs)
-            if 'items' in cls.__dict__:  # accept patch classes as well as instances
-                cls.items = tuple(p() if isinstance(p, type) else p for p in cls.items)
+            if 'all_patches' in cls.__dict__:  # accept patch classes as well as instances
+                cls.all_patches = tuple(p() if isinstance(p, type) else p for p in cls.all_patches)
 
         @property
         def options(self) -> tuple[BasePatch, ...]:
             '''Exposes all user-selectable patches to the UI for the source.'''
-            return tuple(patch for patch in self.items if patch.is_user_selectable)
+            return tuple(patch for patch in self.all_patches if patch.is_user_selectable)
 
         def active(self, flags: SourceRebuildFlags) -> list[BasePatch]:
             '''Patches active for a rebuild with these flags. (NONE is always active)'''
-            return [patch for patch in self.items if patch.is_active(flags)]
+            return [patch for patch in self.all_patches if patch.is_active(flags)]
 
         def get(self, name: str) -> BasePatch | None:
-            return next((patch for patch in self.items if patch.name == name), None)
+            return next((patch for patch in self.all_patches if patch.name == name), None)
 
         class Plan:
             '''
@@ -1130,12 +1190,12 @@ class BaseSource(abc.ABC):
             '''
             def __init__(self, patches: BaseSource.Patches, handle: BlockDevice, flags: SourceRebuildFlags) -> None:
                 self._handle = handle
-                self.active  = tuple(patch for patch in patches.active(flags) if patches.is_physical)
+                self.active: tuple[BaseSource.Patches.BasePhysicalPatch, ...] = tuple(p for p in patches.active(flags) if isinstance(p, BaseSource.Patches.BasePhysicalPatch))
 
             def _raw(self, node: VfsNode) -> bytes:
                 return node.pending_data if node.pending_data is not None else self._handle.pread(node.offset, node.size)
 
-            def _sites(self, node: VfsNode, raw: bytes | None = None) -> list[tuple[BasePhysicalPatch, int]]:
+            def _sites(self, node: VfsNode, raw: bytes | None = None) -> list[tuple[BaseSource.Patches.BasePhysicalPatch, int]]:
                 selected = [patch for patch in self.active if node in patch.candidate_selector([node])]
                 if not selected:
                     return []
@@ -1162,9 +1222,9 @@ class BaseSource(abc.ABC):
         @classmethod
         def validate(cls, source: type[BaseSource]) -> None:
             seen: set[str] = set()
-            for patch in cls.items:
+            for patch in cls.all_patches:
                 if not isinstance(patch, cls.BasePatch):
-                    raise TypeError(f'{source.__name__}.Patches.items must hold BasePatch instances, got {patch!r}')
+                    raise TypeError(f'{source.__name__}.Patches.all_patches must hold BasePatch instances, got {patch!r}')
                 patch.check(source.rebuild_flags)
                 if patch.name:
                     if patch.name in seen:
@@ -1320,11 +1380,11 @@ class BaseSource(abc.ABC):
                 raise TypeError(f'{name}.{attr} is reserved for the component instance; declare `class {attr.capitalize()}:` instead.')
         for attr in BaseSource.COMPONENTS:
             base      = getattr(BaseSource, attr)
-            component = getattr(cls, attr)
+            component: Any = getattr(cls, attr)
             if not (isinstance(component, type) and issubclass(component, base)):
                 raise TypeError(f'{name}.{attr} must be a class that subclasses BaseSource.{attr}, got {component!r}.')
             if attr == 'Builder':
                 if component is not base and inspect.isabstract(component):
                     raise TypeError(f'{name}.Builder is abstract; implement {sorted(component.__abstractmethods__)}.')
             else:
-                component.validate(cls)
+                cast(Any, component).validate(cls)

@@ -20,7 +20,7 @@ from core.workers import (
     TaskCoordinator, ActionStatus, ActionResult, Actions, ActionType, TaskHandle, LogChannel,
     ActionDef, EditorPayload
 )
-from core.contracts import PackageIntent, BasePatch, BaseVirtualPatch
+from core.contracts import BaseSource
 from core.native.block_device import BlockDevice
 from core.navigator import VfsNavigator
 from core.metadata_manager import NodeMetadataStore
@@ -124,11 +124,11 @@ class Dispatcher(QObject):
         if success:
             self.tracker.clear()
 
-    def get_patch_options(self) -> tuple[BasePatch, ...]:
+    def get_patch_options(self) -> tuple[BaseSource.Patches.BasePatch, ...]:
         '''User-toggleable patch options for the active source.'''
         if not self.active_handler:
             return ()
-        return self.active_handler.source.patch_options
+        return self.active_handler.source.patches.options
 
     def rebuild_flags_class(self) -> type[SourceRebuildFlags] | None:
         '''The flags class for the active source so callers can build a flag value without the source.'''
@@ -347,7 +347,7 @@ class Dispatcher(QObject):
             self.nav.request_expansion(node, lambda success, _node: None)
             return
 
-        if action_def.action_type is ActionType.IMPORT and self.nav and self.nav.package_members(node, PackageIntent.IMPORT):
+        if action_def.action_type is ActionType.IMPORT and self.nav and self.nav.package_members(node, BaseSource.Packages.Intent.IMPORT):
             self._execute_package_import(node, action_def, **kwargs)
             return
 
@@ -382,7 +382,7 @@ class Dispatcher(QObject):
                 **kwargs
             )
             task_handle.finished.connect(self._on_action_complete)
-        self.nav.ensure_package(node, PackageIntent.IMPORT, _start_import)
+        self.nav.ensure_package(node, BaseSource.Packages.Intent.IMPORT, _start_import)
 
     def start_iso_rebuild(self, request: RebuildRequest, output_path: Path) -> TaskHandle | None:
         '''
@@ -572,21 +572,18 @@ class Dispatcher(QObject):
 
         Preferably upgrade the data fetch to a background task.
         '''
-        if node.extension:
+        if node.extension or self.active_handler is None:
             return
         if node.is_sentinel:
             logger.debug(f'Skipping extension request, sentinel node has no bytes: {node}')
             return
 
-        source_profile = getattr(self.active_handler, 'source_profile', None)
-        if not source_profile:
-            return
         header: bytes = self.get_node_data(node)[:0x30]
         if len(header.replace(b'\x00', b'')) < 16:
             logger.debug(f'Header too short: {len(header.replace(b"\\x00", b""))} bytes. {node} applying .bin')
             node.extension = '.bin'
         else:
-            node.extension = self.active_handler.source.resolve_extension(node, header) if self.active_handler else '.bin'
+            node.extension = self.active_handler.source.extensions.resolve(node, header)
         if auto_save and self._metadata_store is not None:
             self._metadata_store.register(node.hierarchical_id_str, extension=node.extension)
             logger.debug(f'Extension request saved: {node.hierarchical_id_str} -> {node.extension}')
@@ -797,9 +794,9 @@ class RebuildCoordinator(QObject):
         self.log.emit('Preparing VFS for rebuild...')
         handler = self._dispatcher.active_handler
         source = handler.source if handler else None
-        active_patches: list[BaseVirtualPatch] = [
-            patch for patch in (source.patches_for(build_flags) if source else [])
-            if isinstance(patch, BaseVirtualPatch)
+        active_patches: list[BaseSource.Patches.BaseVirtualPatch] = [
+            patch for patch in (source.patches.active(build_flags) if source else [])
+            if isinstance(patch, BaseSource.Patches.BaseVirtualPatch)
         ]
         self._resolve_patch_targets(staged_nodes, build_flags, active_patches, {})
 
@@ -807,7 +804,7 @@ class RebuildCoordinator(QObject):
         self,
         staged_nodes:  list[VfsNode],
         build_flags:   SourceRebuildFlags,
-        patches:       list[BaseVirtualPatch],
+        patches:       list[BaseSource.Patches.BaseVirtualPatch],
         patch_targets: dict[str, list[VfsNode]],
     ) -> None:
         '''
