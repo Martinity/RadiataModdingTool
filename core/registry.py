@@ -423,7 +423,7 @@ class Registry:
         for source in cls._sources.values():
             lines.append(
                 f'    {source.display_name!r:30s} - {source.display_name:30s} sector_size={source.geometry.sector_size:#x} '
-                f'builder={source.builder.__name__ if source.builder else "None"} patches=[{", ".join(p.name for p in source.patches)}]'
+                f'builder={source.builder.__name__ if source.builder else "None"} patches=[{", ".join(p.name for p in source.patches.all_patches)}]'
             )
         return '\n'.join(lines)
 

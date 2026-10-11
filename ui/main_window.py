@@ -52,7 +52,7 @@ from core.metadata_manager import NodeMetadataStore
 from core.node import VfsNode
 from core.version import __version__
 from core.workers import TaskHandle
-from core.contracts import SourceRebuildFlags, BasePatch
+from core.contracts import SourceRebuildFlags, BaseSource
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
 from PyQt6.QtGui import QAction, QCloseEvent, QColor, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
@@ -798,7 +798,7 @@ class MainMenuBar:
         self._patch_actions.clear()
         self._patch_flags.clear()
 
-        options: tuple[BasePatch, ...] = self.dispatcher.get_patch_options()
+        options: tuple[BaseSource.Patches.BasePatch, ...] = self.dispatcher.get_patch_options()
 
         for option in options:
             action = QWidgetAction(self.patches_menu)

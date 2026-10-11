@@ -192,7 +192,6 @@ class SourceHandler(PhysicalHandler):
         vfs_root = self.source.resolve_boundary(root)
         try:
             builder = self.source.create_builder(
-                source=self.source,
                 handle=self.handle,
                 source_root=root,
                 vfs_root=vfs_root,
