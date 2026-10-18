@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import threading
-import platform
 from enum import Enum, auto
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,22 +157,31 @@ class Dispatcher(QObject):
 
     ###----------------------------------- Public ----------------------------------------###
 
-    def load_source(self, source: Path | VfsNode) -> TaskHandle | list[VfsNode] | None:
-        '''Route a block file or VfsNode to the appropriate handler.'''
-        if isinstance(source, Path):
-            handler_class = Registry.get_handler(source)
+    def load_source(self, source: Path | str | VfsNode) -> TaskHandle | list[VfsNode] | None:
+        '''
+        Route a source to the appropriate handler.
+        Path     ->  ISO image file  -> Ingestion pipeline
+        str      ->  raw device      -> Ingestion pipeline
+        VfsNode  ->  VFS             -> Expansion pipeline
+
+        '''
+        if isinstance(source, (Path, str)):
             from core.contracts import PhysicalHandler
             from core.handlers.iso_container import SourceHandler
-            if (
-                not handler_class or
-                not (isinstance(handler_class, type) and issubclass(handler_class, PhysicalHandler)) or
-                not (isinstance(handler_class, type) and issubclass(handler_class, SourceHandler))
+            handler_class = Registry.get_handler(Path(source))  # Lookup key, not a device path
+            if not (
+                isinstance(handler_class, type)
+                and issubclass(handler_class, PhysicalHandler)
+                and issubclass(handler_class, SourceHandler)
             ):
-                logger.warning(f'No handler for {source.name}, {handler_class}')
+                logger.warning(f'No handler for {source}, {handler_class}')
                 return
-            resolved = resolve_raw_disc_device(source)
-            source_stream = BlockDevice(str(resolved), sector_size=2048)
-            handler = handler_class(source_stream)
+            source_stream = BlockDevice(str(source), sector_size=2048)
+            try:
+                handler = handler_class(source_stream)
+            except BaseException:
+                source_stream.close()  # No signature match
+                raise
             return self._load_physical(handler)
 
         if source.children:
@@ -465,7 +473,12 @@ class Dispatcher(QObject):
         self.nav.resolve_ghost_node(target_hid, on_success)
 
     def close(self) -> None:
-        '''For exiting the dispatch. Refuses to tear down on failed task shutdown.'''
+        '''
+        Stop all tasks and release the source. Used for both a soft reset and hard exit.
+        The active handler owns the device, so closing it releases the device.
+        Refuses to close if a dedicated task did not stop in time.
+        Emits `source_closed` on success.
+        '''
         fully_stopped = self.task_coordinator.shutdown()
         if not fully_stopped:
             logger.error(
@@ -712,47 +725,6 @@ class Dispatcher(QObject):
             logger.error(f'Decode failed: {error_msg}')
             if on_failure:
                 on_failure(error_msg)
-
-###------------------------------------- Block Device Helpers -----------------------------------###
-
-def resolve_raw_disc_device(path: Path) -> Path | str:
-    '''
-    Resolves a mountpoint or drive letter to its raw physical block device path.
-    If the path is already a file, it is returned as-is.
-    '''
-    path = Path(path).resolve()
-    if path.is_file():
-        return path
-    system = platform.system()
-
-    if system == 'Windows':
-        drive_letter = path.drive.rstrip('\\')
-        if drive_letter:
-            return fr'\\.\{drive_letter}'
-        raise ValueError(f'Could not resolve Windows drive letter from {path}')
-
-    elif system == 'Linux':
-        for dev in ['/dev/sr0', '/dev/cdrom', '/dev/dvd']:
-            if Path(dev).exists():
-                return dev
-        with open('/proc/mounts') as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == str(path):
-                    return parts[0]
-        raise FileNotFoundError(f'No optical raw device found for mountpoint {path}')
-
-    elif system == 'Darwin':
-        import subprocess
-        result = subprocess.run(['df', str(path)], capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            if len(lines) > 1:
-                dev = lines[1].split()[0]
-                return dev.replace('/dev/disk', '/dev/rdisk')
-        raise FileNotFoundError(f'Could not resolve macOS disk device for {path}')
-
-    return path
 
 ###--------------------------------------------- Rebuild ---------------------------------------------------###
 

@@ -128,6 +128,6 @@ class ThemeManager:
     def load_custom_font(font_path: Path):
         font_id = QFontDatabase.addApplicationFont(str(font_path))
         if font_id == -1:
-            print(f'Failed to load font: {font_path}')
+            logger.error(f'Failed to load font: {font_path}')
             return None
         return QFontDatabase.applicationFontFamilies(font_id)[0]

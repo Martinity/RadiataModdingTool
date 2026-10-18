@@ -185,7 +185,7 @@ class SourceHandler(PhysicalHandler):
         this way to be easier to expand to adding/removing files in the future.
         '''
         src_path = self.handle.path
-        if output_path.resolve() == src_path.resolve():
+        if not getattr(self.handle, 'is_device', False) and output_path.resolve() == src_path.resolve():
             raise ValueError('Cannot overwrite source ISO')
         if self.pvd is None:
             raise ValueError('PVD not found')
@@ -235,7 +235,7 @@ class SourceHandler(PhysicalHandler):
         Hash the ISO with xxhash and compare against known hashes.
         BlockDevice natively handles the pre-allocation of a zero-copy buffer.
         '''
-        file_size = getattr(self.source, 'size', 0)
+        file_size = getattr(self.handle, 'size', 0) or getattr(self.source, 'size', 0)
         hasher = xxhash.xxh128()
         chunk_size = (24 * 1024 * 1024) # 24MB chunks seemed to load the fastest I have tested
         bytes_read = 0
@@ -243,7 +243,7 @@ class SourceHandler(PhysicalHandler):
             task_handle.checkpoint()
             hasher.update(chunk)
             bytes_read += len(chunk)
-            task_handle.progress.emit(int(bytes_read / file_size * 100))
+            task_handle.progress.emit(int(bytes_read / file_size * 100) if file_size else 0)
         digest = hasher.hexdigest()
         build = self.source.build_hashes.get(digest, f'Modified/Unknown: {digest}')
         return 'Build: ' + build

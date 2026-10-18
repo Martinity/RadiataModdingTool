@@ -61,12 +61,13 @@ class LoggingWindow(QPlainTextEdit):
         self.update_button_position()
 
     def __repr__(self) -> str:
-        lines = self.document().lineCount()
+        doc = self.document()
+        lines = doc.lineCount() if doc else 0
         return f"<LoggingWindow lines={lines}>"
 
     def __str__(self) -> str:
         return "Log Console"
-    
+
     @pyqtSlot(str, int)
     def append_log(self, message: str, level: int):
         '''Slot gets logs from QtLogHandler'''
@@ -100,13 +101,14 @@ class LoggingWindow(QPlainTextEdit):
             self.moveCursor(QTextCursor.MoveOperation.End)
             QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
 
-    def resizeEvent(self, event):
+    def resizeEvent(self, event): # type: ignore
         super().resizeEvent(event)
         self.update_button_position()
 
     def update_button_position(self) -> None:
         padding = 4
-        scroll_width = self.verticalScrollBar().width() if self.verticalScrollBar() else 0
+        v_bar = self.verticalScrollBar() if self.verticalScrollBar() else 0
+        scroll_width = v_bar.width() if v_bar else 0
         button_width = self.clear_button.width()
         x = self.width() - button_width - padding * 2 - scroll_width
         y = padding

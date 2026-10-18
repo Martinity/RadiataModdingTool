@@ -172,20 +172,8 @@ class PhysicalHandler(BaseHandler):
     '''
     def __init__(self, source: BlockDevice, parent_node: VfsNode | None = None) -> None:
         super().__init__(parent_node)
-        self.source: BlockDevice = source
-        self.handle: BlockDevice = self.source
+        self.handle: BlockDevice = source
         self.owns_handle = True
-
-
-    def release_handle(self) -> None:
-        '''
-        Release the init handle after get_file_tree().
-        Subsequent physical node access must open private handles with source_path
-        '''
-        if self.handle and not self.handle.closed:
-            self.handle.close()
-        self.handle = None  # type: ignore dereference for safety
-        self.owns_handle = False
 
     @abc.abstractmethod
     def rebuild_node(

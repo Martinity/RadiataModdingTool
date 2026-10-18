@@ -126,7 +126,6 @@ class Registry:
             f'Locked -- {len(cls._handler_profiles)} handler(s), {len(cls._editor_profiles)} editor(s)'
             f'{len(cls._global_editors)} global editor(s), {len(cls._sources)} source(s)'
         )
-        print(cls.summary())
 
     @classmethod
     def reset(cls) -> None:
@@ -310,7 +309,7 @@ class Registry:
             path_str = str(source)
             is_physical_drive = False
             if platform.system() == 'Windows':
-                is_physical_drive = path_str.startswith(r'\\\\.\\')
+                is_physical_drive = path_str.startswith('\\\\.\\')
             else:
                 try:
                     is_physical_drive = source.exists() and (source.is_block_device() or source.is_char_device())

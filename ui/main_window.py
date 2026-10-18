@@ -43,8 +43,10 @@ import threading
 import platform
 import json
 import subprocess
-import os
-from enum import IntEnum, Enum, auto
+import errno
+import ctypes
+import string
+from enum import IntEnum
 from pathlib import Path
 
 from core.dispatcher import Dispatcher, RebuildCoordinator, LogChannel, ConflictChoice
@@ -53,13 +55,12 @@ from core.node import VfsNode
 from core.version import __version__
 from core.workers import TaskHandle
 from core.contracts import SourceRebuildFlags, BaseSource
-from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
-from PyQt6.QtGui import QAction, QCloseEvent, QColor, QStandardItem, QStandardItemModel
+from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint, QFile
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QStandardItem, QStandardItemModel, QResizeEvent
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenuBar,
+    QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenuBar,
     QMessageBox, QProgressBar, QPushButton, QStackedWidget, QStatusBar, QTextEdit, QWidgetAction,
-    QTreeView, QVBoxLayout, QWidget, QTabWidget, QLineEdit, QComboBox, QSizePolicy, QCheckBox,
-    QRadioButton, QDialogButtonBox
+    QTreeView, QVBoxLayout, QWidget, QTabWidget, QLineEdit, QComboBox, QCheckBox,
 )
 from ui.editor_page import EditorPage
 from ui.file_browser_page import FileBrowserBehavior, FileBrowserPage
@@ -173,12 +174,13 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         """Routes main window state signals between UI pages or dispatcher"""
-        self.welcome_page.request_open.connect(self.attempt_load_source)
+        self.welcome_page.source_selected.connect(self.attempt_load_source)
         self.file_browser_page.btn_review.clicked.connect(lambda: self.stack.setCurrentIndex(AppPage.STAGING))
         self.staging_page.request_file_browser.connect(lambda: self.stack.setCurrentIndex(AppPage.FILEBROWSER))
         self.editor_page.back_requested.connect(lambda: self.stack.setCurrentIndex(AppPage.FILEBROWSER))
 
         self.dispatcher.source_loaded.connect(self._on_source_loaded)
+        self.dispatcher.source_closed.connect(self._on_source_closed)
         self.dispatcher.source_verified.connect(lambda build: self.status_bar.showMessage(build))
 
         self.rebuild_coordinator.preparing_build.connect(self._on_rebuild_prep_started)
@@ -257,30 +259,44 @@ class MainWindow(QMainWindow):
 
     def _toggle_menu_actions(self, has_iso: bool) -> None:
         '''Toggle menu options based on the iso loaded state'''
+        self.menu_manager.dump_metadata.setEnabled(has_iso)
         self.menu_manager.open_action.setEnabled(not has_iso)
         self.menu_manager.close_action.setEnabled(has_iso)
         self.menu_manager.verify_hash.setEnabled(has_iso)
         self.menu_manager.apply_patches.setEnabled(has_iso)
         self.menu_manager.refresh_patches_menu()
 
-    ###----------------------------------- ISO ----------------------------------###
+    ###----------------------------------- Filesystem ----------------------------------###
 
-    def attempt_load_source(self, path: Path) -> None:
+    def attempt_load_source(self, source: Path | str) -> None:
         """
-        Prompt the user for an ISO and pass the path to the dispatcher.
-        ISO processing happens on a background thread.
-        If dispatcher returns without a handle the ISO failed to load and the UI resets.
+        Single entry point for loading a source. Path = ISO image, str = raw device.
+        The device or file is opened here on the main thread so an open failure is shown immediately.
+        All processing happens on a worker and reports back through `Dispatcher.source_loaded`
         """
-        self.app_settings.last_iso_dir = str(path)
-        self.status_bar.showMessage(f'Loading {path.name}...')
+        name = source.name if isinstance(source, Path) else source
+        if isinstance(source, Path):
+            self.app_settings.last_iso_dir = str(source)
+        self.status_bar.showMessage(f'Loading {name}...')
         self.welcome_page.set_loading(True)
-        task_handle = self.dispatcher.load_source(path)
-        if not isinstance(task_handle, TaskHandle):
-            QMessageBox.critical(self, 'Load Error', f'No handler for {path.name}')
-            self.welcome_page.set_loading(False)
+        try:
+            task_handle = self.dispatcher.load_source(source)
+        except (OSError, ValueError) as e:  # OSError: the open failed. ValueError: unknown source (no registered source profile matched).
+            logger.error(f'Could not open {name}: {e}')
+            self._abort_load()
+            QMessageBox.critical(self, 'Cannot open source', self.describe_open_error(name, e))
+            return
+        if not isinstance(task_handle, TaskHandle):  # The dispatcher found no registered PhysicalHandler for the source
+            self._abort_load()
+            QMessageBox.critical(self, 'Load Error', f'No handler for {name}')
             return
         self._reload_metadata_for_source()
         task_handle.log_message.connect(self._on_worker_log)
+
+    def _abort_load(self) -> None:
+        '''Undo the "Loading..." UI state after a load failed before a worker started.'''
+        self.welcome_page.set_loading(False)
+        self.status_bar.clearMessage()
 
     def _on_rebuild_prep_started(self) -> None:
         self.stack.setCurrentIndex(AppPage.REBUILD)
@@ -318,6 +334,13 @@ class MainWindow(QMainWindow):
         self.file_browser_page.setFocus()
         self._toggle_menu_actions(has_iso)
 
+    def _on_source_closed(self) -> None:
+        '''The dispatcher released its source (menu Close, or app exit). Return the UI'''
+        self._toggle_menu_actions(has_iso=False)
+        self.welcome_page.set_loading(False)
+        self.stack.setCurrentIndex(AppPage.WELCOME)
+        self.status_bar.clearMessage()
+
     def _reload_metadata_for_source(self) -> None:
         handler = getattr(self.dispatcher, 'active_handler', None)
         source = getattr(handler, 'source', None)
@@ -350,6 +373,30 @@ class MainWindow(QMainWindow):
         choice = dialog.selected_choice()
         self.conflict_choice_made.emit(new_node, choice)
 
+    @staticmethod
+    def describe_open_error(name: str, err: Exception) -> str:
+        '''User-facing text for a failed source open.'''
+        if isinstance(err, ValueError):
+            return f'{name} was opened but is not a supported disc:\n{err}'
+        winerr = getattr(err, 'winerror', None)
+        code = getattr(err, 'errno', None)
+        is_windows = platform.system() == 'Windows'
+        if winerr == 5 or code in (errno.EACCES, errno.EPERM):
+            if is_windows:
+                hint = 'Run the tool in administrator, or open an ISO image instead.'
+            elif platform.system() == 'Darwin':
+                hint = 'Grant this app Full Disk Access in System Settings > Privacy & Security, or run it with sufficient privileges.'
+            else:
+                hint = 'Add your user to the "cdrom" group and relog, or run with sufficient privileges.'
+            return f'Access denied opening {name}.\n{hint}'
+        if winerr in (21, 1112, 1117, 1167, 1785) or code in (getattr(errno, 'ENOMEDIUM', -1), errno.ENXIO):
+            return f'{name} is not ready. Is there a disc in the drive?'
+        if winerr == 32:
+            return f'{name} is in use by another program.'
+        if winerr in (2, 3) or code == errno.ENOENT:
+            return f'{name} was not found. Was the drive removed?'
+        return f'Could not open {name}:\n{err}'
+
     ###------------------------------------- Lifecycle --------------------------------------###
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
@@ -365,12 +412,16 @@ class MainWindow(QMainWindow):
 
 ###-------------------------------------- Welcome Page --------------------------------------###
 
+def pick_iso_file(parent: QWidget, start_dir: str = '') -> str:
+    '''The ISO file chooser, shared by the Open menu and the welcome page Browser button.'''
+    path, _ = QFileDialog.getOpenFileName(parent, 'Select ISO', start_dir, 'ISO Files (*.iso);;All Files (*)')
+    return path
 
 class WelcomePage(QWidget):
     """
     Initial landing page prompting the user to load a source ISO.
     """
-    request_open = pyqtSignal(Path)
+    source_selected = pyqtSignal(object)  # Path (iso file) | str (raw device). forwarded from DeviceOrIso
 
     def __init__(self, settings, parent=None) -> None:
         super().__init__(parent)
@@ -384,20 +435,15 @@ class WelcomePage(QWidget):
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
 
-        self.device_widget = DeviceOrIsoDialog(
+        self.device_widget = DeviceOrIso(
             parent=self,
             last_dir=self.settings.last_iso_dir or ''
         )
-        self.device_widget.source_selected.connect(self._on_source_selected)
+        self.device_widget.source_selected.connect(self.source_selected)
         layout.addWidget(self.device_widget, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch()
 
         self.set_loading(False)
-
-    def _on_source_selected(self, path: Path) -> None:
-        if path.is_file() or path.is_dir():
-            self.settings.last_iso_dir = str(path)
-        self.request_open.emit(path)
 
     def set_loading(self, is_loading: bool) -> None:
         if is_loading:
@@ -408,18 +454,17 @@ class WelcomePage(QWidget):
             self.device_widget.btn_confirm.setEnabled(True)
 
 
-class DeviceOrIsoDialog(QWidget):
+class DeviceOrIso(QWidget):
     '''
     A custom file dialog widget that allows the user to select either an existing ISO file
     from the pc's file browser or a physical block device/optical drive.
     Cross-platform compatible.
     '''
-    source_selected = pyqtSignal(Path)
+    source_selected = pyqtSignal(object)  # Path | str
 
     def __init__(self, parent=None, last_dir: str = '') -> None:
         super().__init__(parent)
         self.last_dir = last_dir
-        self.selected_path: Path | None = None
         self.setFixedWidth(600)
         self.setFixedHeight(330)
         self.setObjectName('SurfaceTabPanel')
@@ -434,18 +479,13 @@ class DeviceOrIsoDialog(QWidget):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-
         self.btn_confirm = QPushButton()
         self.btn_confirm.setObjectName('BtnLarge')
         self.btn_confirm.clicked.connect(self._on_confirm)
-
         btn_layout.addWidget(self.btn_confirm)
         layout.addLayout(btn_layout)
 
-    def _check_elevation(self) -> bool:
-        if platform.system() != 'Windows' and self.selected_path:
-            return os.access(self.selected_path, os.R_OK)
-        return True
+    ###--------------------------------------- Tabs -----------------------------------------------###
 
     def _create_iso_tab(self) -> QWidget:
         widget = QWidget()
@@ -478,111 +518,124 @@ class DeviceOrIsoDialog(QWidget):
         return widget
 
     def _browse_iso(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            'Select ISO',
-            self.last_dir,
-            'ISO Files (*.iso);;All Files (*)'
-        )
+        path = pick_iso_file(self, self.last_dir)
         if path:
             self.iso_path_input.setText(path)
 
+    ###------------------------------ Device Enumeration------------------------------####
+    # Each platform lists its optical drives with a native tool, then _add_device fills the combo box
+    # The combo's userData is the string BlockDevice opens
+
+    def _add_device(self, label: str, raw_path: str) -> None:
+        self.device_combo.addItem(label, userData=raw_path)
+
     def _populate_device_combo(self) -> None:
         self.device_combo.clear()
-        system = platform.system()
+        enumerate_devices = {
+            'Windows': self._enumerate_windows,
+            'Linux':   self._enumerate_linux,
+            'Darwin':  self._enumerate_macos,
+        }.get(platform.system())
         try:
-            if system == 'Windows':
-                # bitmask of active logical drives
-                import ctypes, string
-                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-                for i, letter in enumerate(string.ascii_uppercase):
-                    if bitmask & (1 << i):
-                        drive_root = f'{letter}:\\'
-                        if ctypes.windll.kernel32.GetDriveTypeW(drive_root) == 5:
-                            device_path = f'\\\\.\\{letter}:'
-                            self.device_combo.addItem(f'{letter} Optical Drive ({device_path})', userData=device_path)
-            elif system == 'Linux':
-                result = subprocess.run(
-                    ['lsblk', '-J', '-o', 'NAME,SIZE,TYPE,PATH,MOUNTPOINT'],
-                    capture_output=True, text=True, check=True,
-                )
-                data = json.loads(result.stdout)
-                for device in data.get('blockdevices', []):
-                    self._parse_lsblk_node(device)
-            elif system == 'Darwin':
-                result = subprocess.run(
-                    ['diskutil', 'list', '-plist'],
-                    capture_output=True, check=True,
-                )
-                if result.stdout:
-                    import plistlib
-                    plist = plistlib.loads(result.stdout)
-                    for device in plist.get('AllDisksAndPartitions', []):
-                        self._parse_diskutil_node(device)
+            if enumerate_devices:
+                enumerate_devices()
         except Exception as e:
+            logger.warning(f'Device enumeration failed: {e}')
             self.device_combo.addItem(f'Error enumerating devices: {e}', userData='')
         if self.device_combo.count() == 0:
             self.device_combo.addItem('No Optical Drive found.', userData='')
 
+    def _enumerate_windows(self) -> None:
+        '''Every CD-ROM class drive letter as a raw volume `\\\\.\\X:`'''
+        # bitmask of active logical drives
+        DRIVE_CDROM = 5
+        kernel32 = ctypes.windll.kernel32
+        SEM_FAILCRITICALERRORS = 0x0001
+        previous = ctypes.c_uint(0)
+        # Probing an empty drive must fail with an error code, not pop the "no disk in the drive" dialog
+        kernel32.SetThreadErrorMode(SEM_FAILCRITICALERRORS, ctypes.byref(previous))
+        try:
+            bitmask = kernel32.GetLogicalDrives()
+            for i, letter in enumerate(string.ascii_uppercase):
+                root = f'{letter}:\\'
+                if bitmask & (1 << i) and kernel32.GetDriveTypeW(root) == DRIVE_CDROM:
+                    volume = ctypes.create_unicode_buffer(261)
+                    has_disc = kernel32.GetVolumeInformationW(root, volume, 261, None, None, None, None, 0)
+                    label = f'[Optical Drive] {letter}: - {volume.value or "(unlabelled)"}' if has_disc \
+                        else f'[Optical Drive] {letter}: (no disc)'
+                    self._add_device(label, f'\\\\.\\{letter}:')
+        finally:
+            kernel32.SetThreadErrorMode(previous.value, None)
+
+    def _enumerate_linux(self) -> None:
+        result = subprocess.run(
+            ['lsblk', '-J', '-o', 'NAME,SIZE,TYPE,PATH,MOUNTPOINT'],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(result.stdout)
+        for device in data.get('blockdevices', []):
+            self._parse_lsblk_node(device)
+
+    def _enumerate_macos(self) -> None:
+        result = subprocess.run(
+            ['diskutil', 'list', '-plist'],
+            capture_output=True, check=True,
+        )
+        if result.stdout:
+            import plistlib
+            plist = plistlib.loads(result.stdout)
+            for device in plist.get('AllDisksAndPartitions', []):
+                self._parse_diskutil_node(device)
+
     def _parse_lsblk_node(self, device: dict) -> None:
-        dtype = device.get('type', '')
-        if dtype != 'rom':
+        if device.get('type') != 'rom':
             return
         path  = device.get('path') or f"/dev/{device.get('name')}"
         size  = device.get('size', '')
-        mount = device.get('mountpoint' , '')
-        label = f'{path} - {dtype.upper()} ({size})'
+        mount = device.get('mountpoint', '')
+        label = f'[Optical Drive] {path} ({size})'
         if mount:
             label += f' [Mounted: {mount}]'
-        if dtype == 'rom':
-            label = f'[Optical Drive] {path} ({size})'
-        self.device_combo.addItem(label, userData=path)
+        self._add_device(label, path)
 
     def _parse_diskutil_node(self, device: dict) -> None:
         dev_id = device.get('DeviceIdentifier', '')
         if not dev_id:
             return
-        # Filter out non-optical drive devices
+        # Only keep drives prefixed with "Optical". This is not certain, it was the ai suggestion.
         try:
-            info_proc = subprocess.run(['diskutil', 'info', '-plist', dev_id], capture_output=True, text=True)
             import plistlib
+            info_proc = subprocess.run(['diskutil', 'info', '-plist', dev_id], capture_output=True, check=True)
             info_plist = plistlib.loads(info_proc.stdout)
-            if not info_plist.get('OpticalDrive'):
-                return
-        except Exception:
+        except Exception as e:
+            logger.debug(f'diskutil info failed for {dev_id}: {e}')
+        if not any(key.statswith('Optical') and value for key, value in info_plist.items()):
             return
-
-        # Construct raw disk path
+        # The raw node (/dev/rdiskN) is the one that supports unbuffered, sector-aligned reads
         path = f'/dev/r{dev_id}'
         size_bytes = device.get('Size', 0)
-        if size_bytes > 0:
-            size = human_size(size_bytes)
-        else:
-            size = 'Unknown Size'
-        # Plist structures
+        size = human_size(size_bytes) if size_bytes > 0 else 'Unknown Size'
         volume_name = device.get('VolumeName', '')
         label = f'[Optical Drive] {path} ({size})'
         if volume_name:
             label += f' - {volume_name}'
-        self.device_combo.addItem(label, userData=path)
+        self._add_device(label, path)
+
+    ###-------------------------------- Confirmation --------------------------------------###
 
     def _on_confirm(self) -> None:
-        if not self._check_elevation():
-            raise PermissionError('Insufficient permissions for optical drive access.')
         if self.tabs.currentIndex() == 0:
             path_str = self.iso_path_input.text().strip()
-            if not path_str:
+            if not path_str or not Path(path_str).is_file():
                 QMessageBox.warning(self, 'Invalid Path', 'Please specify a valid ISO file.')
                 return
-            self.selected_path = Path(path_str)
-        else:
-            path_str = self.device_combo.currentData()
-            if not path_str:
-                QMessageBox.warning(self, 'Invalid Device', 'Please select a valid optical drive.')
-                return
-            self.selected_path = Path(path_str)
-        self.source_selected.emit(self.selected_path)
-
+            self.source_selected.emit(Path(path_str))
+            return
+        device = self.device_combo.currentData()
+        if not device:
+            QMessageBox.warning(self, 'Invalid Device', 'Please select a valid optical drive.')
+            return
+        self.source_selected.emit(device)
 
 ###------------------------------------- Rebuilding Page -----------------------------------###
 
@@ -689,6 +742,7 @@ class MainMenuBar:
 
         self.dump_metadata = QAction('Dump metadata', self.window)
         self.dump_metadata.triggered.connect(self._handle_meta_dump)
+        self.dump_metadata.setEnabled(False)
         file_menu.addAction(self.dump_metadata)
 
         self.verify_hash = QAction('Verify hash', self.window)
@@ -835,24 +889,16 @@ class MainMenuBar:
         self.window.dispatcher._handle_verify_hash()
 
     def _handle_open(self) -> None:
-        start_dir = self.settings.last_iso_dir or ''
-        path, _ = QFileDialog.getOpenFileName(
-            self.window, 'Open ISO', start_dir, 'ISO Files (*.iso);;All Files (*)'
-        )
+        path = pick_iso_file(self.window, self.settings.last_iso_dir or '')
         if path:
-            self.settings.last_iso_dir = str(Path(path).parent)
             self.window.attempt_load_source(Path(path))
 
     def _handle_close(self) -> None:
+        '''Soft reset. The dispatcher will emit `source_closed`.'''
         self.dispatcher.close()
-        self.window._toggle_menu_actions(has_iso=False)
-        self.verify_hash.setEnabled(False)
-        self.window.welcome_page.set_loading(False)
-        self.window.stack.setCurrentIndex(AppPage.WELCOME)
-        self.window.status_bar.clearMessage()
 
     def _handle_exit(self) -> None:
-        QApplication.quit()
+        self.window.close()  # Exit through MainWindow.closeEvent rather than explicit shutdown, single exitpoint
 
     def _handle_theme_change(self, theme_name: str) -> None:
         for name, action in self._theme_actions.items():

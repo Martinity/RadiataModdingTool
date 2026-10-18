@@ -117,7 +117,7 @@ class NativeRegistry:
     def _find_c_compiler(cls) -> str | None:
         '''Find the C compiler for the current platform.'''
         if sys.platform.startswith('win'):
-            return shutil.which('gcc')
+            return shutil.which('gcc') or shutil.which('clang')
         return shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
 
     @classmethod
@@ -172,6 +172,7 @@ class NativeRegistry:
                 '-std=c99',
                 '-Wall',
                 '-Wextra',
+                '-Wno-unused-command-line-argument', # Silence unused gcc flags for clang
                 *platform_flags,
                 *module.cflags,
                 '-o',

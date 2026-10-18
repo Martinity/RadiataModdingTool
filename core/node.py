@@ -381,7 +381,6 @@ class VfsManager(QObject):
             return
         logger.warning(f'Enriching initial tree, the children of {self.vfs_root}')
         for child in self.vfs_root.children:
-            logger.warning(f'Enriching child: {child.name}, size: {child.size}, offset {child.offset}')
             self.enrich_node(child)
             if child.is_boundary:
                 continue

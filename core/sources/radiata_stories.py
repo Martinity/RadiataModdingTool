@@ -2462,7 +2462,8 @@ class RadiataStoriesSource(BaseSource):
     ### Identification
     def matches(self, handle: BlockDevice) -> bool:
         offset = (self.geometry.iso_9660_pvd * self.geometry.sector_size) + self.signature_offset
-        return handle.pread(offset, len(self.signature)) == self.signature
+        peek = handle.pread(offset, len(self.signature))
+        return peek == self.signature
 
     def validate_filesystem(self, root_children: list[VfsNode]) -> None:
         found_names = {child.name for child in root_children}
@@ -2555,7 +2556,7 @@ class RadiataStoriesSource(BaseSource):
                 for slot in range(_MAX_PACK_SLOTS):
                     sub_header = links.link_of(hid + (slot,))
                     if sub_header is not None:
-                        members.append(self.Member(slot_header_role(slot), sub_header, required=False))
+                        members.append(self.Member(slot_header_role(slot), sub_header, required=True))
             return tuple(members)
 
     class Metadata(BaseSource.Metadata):
