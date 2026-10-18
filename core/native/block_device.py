@@ -109,8 +109,8 @@ def _normalise_path(path: str) -> str:
     '''Drop trailing slashes from a bare Windows drive device so it names the raw volume'''
     if _IS_WINDOWS:
         bare_drive = _WIN_BARE_DRIVE.match(path)
-    if bare_drive:
-        return bare_drive.group(1)
+        if bare_drive:
+            return bare_drive.group(1)
     return path
 
 def _os_error(code: int, path: str, action: str = 'open') -> OSError:
