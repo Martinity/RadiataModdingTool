@@ -7,9 +7,9 @@ VfsNode (File data):
     async expansion state, and pending data payloads.
 
 VfsManager (Relational data):
-    Central relational manager providing O(1) HID lookup tables for VFS and ISO
-    nodes. Handles structural node mutations (insertions, removals, sentinels) and
-    emits Qt signals to synchronize the UI model.
+    Central relational manager owning the namespaces. O(1) lookup of any node by Address = (mid, hid).
+    Handlers structural node mutations (insertion, removals, sentinels) and emits signals to
+    synchronize the UI model.
 
 ModTracker (Mutation tracking):
     Tracks modified nodes, staged rebuild queues, and original file backups.
@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import NamedTuple, Callable, TYPE_CHECKING, Iterator, Sequence
+from typing import NamedTuple, Callable, TYPE_CHECKING, Iterator, Sequence, TypeAlias
 from PyQt6.QtCore import pyqtSignal, QObject
 if TYPE_CHECKING:
     from core.handlers.compression_container import CompressorHandler
@@ -29,6 +29,14 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
 
+###------------------------------------------- Namespaces -----------------------------------------------------###
+
+Mid:     TypeAlias = int                # namespace id - assigned by source
+Hid:     TypeAlias = tuple[int, ...]    # path of a node inside its namespace
+Address: TypeAlias = tuple[Mid, Hid]    # how every node is addressed
+
+PHYSICAL: Mid = 0   # default for the physical file root
+DEFAULT:  Mid = 1   # default for the asset filesystem
 
 ###--------------------------------------------- VFS Node ------------------------------------------------------###
 
@@ -66,14 +74,15 @@ class VfsNode:
         self.parent_header: CompressorHandler.SlzHeader | bytes | None = None    # Original header of the parent node used for rebuilding children
         self.logical_id: int | None = None                  # Logical ID from the TOC used for ISO rebuilding
 
-        self._id_path: tuple[int, ...] = hid                # hierarchical id (root, sub, subsub)
+        self._id_path: Hid = hid                            # hierarchical id (root, sub, subsub)
+        self.mid:     Mid = PHYSICAL                       # the namespace this node belongs to
+        self.mount_id: Mid | None = None                    # set when the node is itself the namespace root
 
         self.status = NodeStatus.UNMODIFIED                 # node state
         self._pending_data: bytes | None = None             # cached data
 
         self.is_physical   = False                          # Has physical address
         self.is_hidden     = False                          # Hide node in UI (file system related or null nodes by default)
-        self.is_boundary   = False                          # The entrypoint node for the VFS, as specified by the source profile
 
         self._lock                   = threading.RLock()     # Structural lock for parent-child mutations/access
         self.expansion_pending: bool = False                 # True while an expansion is in-flight
@@ -83,19 +92,21 @@ class VfsNode:
 
         self._row: int = 0                                   # Cached row index within parent
 
+    def _place(self, child: VfsNode, row: int) -> None:
+        '''Join child to this node at row. It belongs to the namespace this node roots'''
+        child.parent = self
+        child._row = row
+        if self.mount_id is None:
+            child.mid, child._id_path = self.mid, self._id_path + (row,)
+        else:
+            child.mid, child._id_path = self.mount_id, (row,)
+
     def append_child(self, child: VfsNode):
         '''
-        Called to add a child node to this node.
-        Keeps separate HID increments for ISO and VFS nodes, split by boundary flag.
-        '''
+        Called to add a child node to this node. Keeps separate HID increments per namespace.'''
         with self._lock:
             self.children.append(child)
-            child.parent = self
-            child._row = len(self.children) - 1
-            if self.is_boundary:
-                child._id_path = (child._row,)
-            else:
-                child._id_path = self._id_path + (child._row,)
+            self._place(child, len(self.children) - 1)
 
     def make_sentinel(self):
         '''
@@ -167,9 +178,14 @@ class VfsNode:
             self._offset = value
 
     @property
-    def hierarchical_id(self) -> tuple[int, ...]:
-        '''Return tuple id'''
+    def hierarchical_id(self) -> Hid:
+        '''Return tuple id, relative to this node's namespace'''
         return self._id_path
+
+    @property
+    def address(self) -> Address:
+        '''(mid, hid): unique across every namespace'''
+        return (self.mid, self._id_path)
 
     @property
     def hierarchical_id_str(self) -> str:
@@ -216,8 +232,17 @@ class VfsNode:
 
     @property
     def depth(self) -> int:
-        '''Depth in the respective iso/vfs tree.'''
+        '''Depth in the respective namespace.'''
         return len(self._id_path)
+
+    @property
+    def absolute_depth(self) -> int:
+        '''Depth from the highest namespace.'''
+        depth, node = 0, self.parent
+        while node is not None:
+            depth += 1
+            node = node.parent
+        return depth
 
     def walk_to_physical(self) -> Iterator[VfsNode]:
         '''
@@ -246,7 +271,7 @@ class VfsNode:
         '''Return an ordered list of node to reach the source.'''
         chain = list(self.walk_to_physical())
         if not chain or not chain[-1].is_physical:
-            logger.warning(f'{self}: no is_physical ancestor found, tree may be corrupt.')
+            logger.debug(f'{self}: no is_physical ancestor found (expected for a namespace with no physical nodes).')
             return []
         chain.reverse()
         return chain
@@ -258,15 +283,20 @@ class VfsNode:
 
 class HidSnapshot(NamedTuple):
     '''Result of a lock-protect VFS snapshot'''
-    resolved: list[VfsNode]             # nodes already in the VFS
-    unresolved: list[tuple[int, ...]]   # HIDs whose parent need expansion
+    resolved:   list[VfsNode]      # nodes already in the VFS
+    unresolved: list[Address]      # addresses whose ancestor need expansion
 
 class VfsManager(QObject):
     '''
-    Holds O(N) node lookup tables for VFS and ISO nodes.
+    Owns the namespaces and the lookup into them. Addresses are always (mid, hid)
 
-    Registration is valid for both VFS and ISO nodes during init.
-    After which, the only way to register new ISO nodes is to add a child to root.
+    A namespace is a subtree with its own HID space, rooted at a mount point node (VfsNode.mount_id).
+    Every node belongs to the namespace of its nearest ancestor mount point (node.mid) and
+    is registered under (node.mid, node.hierarchical_id). Registering a node registeres all of its
+    descendants. The tree root is the root of the physical namespace.
+
+    Which namespaces exist is up the active source (BaseSource.Namespaces). VfsManager only stores
+    the currently accessible namespaces.
     '''
     insert_start      = pyqtSignal(VfsNode, int, int) # (parent, first_row, last_row)
     insert_finished   = pyqtSignal()
@@ -279,41 +309,51 @@ class VfsManager(QObject):
     def __init__(
         self,
         root:          VfsNode,
-        vfs_root:      VfsNode,
+        default:       Mid = DEFAULT,
         node_enricher: Callable[[VfsNode], None] | None = None,
+        mount_point:   Callable[[VfsNode], Mid | None] | None = None,
     ) -> None:
+        '''
+        default         the namespace the UI works in
+        node_enricher   enriches a node with metadata
+        mount_point     mount ids for namespaces that are lazily discovered
+        '''
         super().__init__()
         self.root        = root
-        self.vfs_root    = self._validate_vfs_boundary(vfs_root)
+        self.default     = default
         self.enrich_node = node_enricher
+        self.mount_point = mount_point
         self._lock       = threading.RLock()
 
-        self.vfs_nodes_by_id:  dict[tuple[int, ...], VfsNode] = {}  # VFS-only hid lookup map
-        self.iso_nodes_by_id:  dict[tuple[int, ...], VfsNode] = {}  # ISO-only hid lookup map, only mutated during init
+        self._namespaces:      dict[Mid, dict[Hid, VfsNode]] = {}   # accessible namespaces
         self.physical_offsets: dict[VfsNode, int] = {}              # Physical disk map
-        self._register_recursive(self.root, self.iso_nodes_by_id)   # Register physical nodes with VFS initilization
+        self._register_recursive(self.root)
+        if default not in self._namespaces:
+            raise ValueError(f'Default namespace {default} has no mount point in the tree!')
 
-    @staticmethod
-    def _validate_vfs_boundary(vfs_root: VfsNode) -> VfsNode:
-        if not vfs_root.is_boundary:
-            raise ValueError(f'VfsManager requires an already resolved VFS boundary node: got {vfs_root!r}')
-        return vfs_root
+    @property
+    def accessible(self) -> frozenset[Mid]:
+        '''Namespaces whose mount point is currently in the tree'''
+        with self._lock:
+            return frozenset(self._namespaces)
 
     ###--------------------- Registration ----------------------###
 
-    def _register_recursive(self, node: VfsNode, target_dict: dict[tuple[int, ...], VfsNode]) -> None:
+    def _register_recursive(self, node: VfsNode) -> None:
         '''
-        Register node and all its children.
-        Node is registered in the target_dict (vfs or iso).
+        Register node and all its children inside their namespace.
 
         After initialization, must be called inside _lock.
         '''
-        target_dict[node.hierarchical_id] = node
+        self._namespaces.setdefault(node.mid, {})[node.hierarchical_id] = node
+        if node.mount_id is not None:
+            table = self._namespaces.setdefault(node.mount_id, {})
+            if table.get(()) not in (None, node):
+                raise ValueError(f'Namespace {node.mount_id} is already mounted at {table[()].address}, cannot also mount {node!r}')
+            table[()] = node
         self.physical_offsets[node] = node.offset
-
-        next_dict = self.vfs_nodes_by_id if node is self.vfs_root else target_dict
         for child in node.children:
-            self._register_recursive(child, next_dict)
+            self._register_recursive(child)
 
     def insert_children(self, parent: VfsNode, new_children: list[VfsNode]) -> None:
         '''
@@ -326,46 +366,27 @@ class VfsManager(QObject):
         '''
         if not new_children:
             return
-        assert parent is not self.vfs_root, (
-            'vfs_entry\'s children must be populated at initialization, not lazily via insert_children'
-        )
         with self._lock:
             base_idx = len(parent.children)
+            claimed: set[Mid] = set()
+            for i, child in enumerate(new_children):  # Place and classify before the tree is touched, conflicts raised
+                parent._place(child, base_idx + i)
+                if self.mount_point and (mid := self.mount_point(child)) is not None:
+                    child.mount_id = mid
+                if child.mount_id is not None:
+                    if child.mount_id in claimed or () in self._namespaces.get(child.mount_id, {}):
+                        raise ValueError(f'Namespace {child.mount_id} is already mounted, cannot also mount {child}')
+                    claimed.add(child.mount_id)
             self.insert_start.emit(parent, base_idx, base_idx + len(new_children) - 1)
-            for i, child in enumerate(new_children): # Add the nodes to the file system / tree
-                child.parent = parent
-                child._id_path = parent._id_path + (base_idx + i,)
-                child._row = base_idx + i
+            for child in new_children: # Add the nodes to the file system / tree
                 child.is_hidden = bool(parent.is_hidden or not child.size or child.offset == -1)
                 if self.enrich_node:
                     self.enrich_node(child)
                 if not child.extension and not child.is_hidden and not child.is_sentinel:
                     self.request_extension.emit(child)
                 parent.children.append(child)
-                self._register_recursive(child, self.vfs_nodes_by_id)
+                self._register_recursive(child)
             self.insert_finished.emit()
-
-    # def remove_child(self, node: VfsNode, on_remove: Callable[[VfsNode], None] | None = None) -> None:
-    #     '''Replace node's own data with a sentinel in place. All children are dropped.'''
-    #     if node is self.vfs_root or node.is_boundary:
-    #         logger.warning('VFS boundary node is crucial, aborting data clear.')
-    #         return
-    #     if on_remove:
-    #         on_remove(node)
-    #     with self._lock:
-    #         self.remove_node(node)
-
-    # def remove_children(self, parent: VfsNode, on_remove: Callable[[VfsNode], None] | None = None) -> None:
-    #     '''Recursively fully delete children from parent'''
-    #     with self._lock:
-    #         direct_children = parent.children_snapshot
-    #         if not direct_children:
-    #             return
-    #         if on_remove:
-    #             for child in direct_children:
-    #                 on_remove(child)
-    #         for child in direct_children:
-    #             self.remove_node(child)
 
     def update_node(self, node: VfsNode) -> None:
         '''Signal to the UI that a node's data has changed, redraw.'''
@@ -375,27 +396,43 @@ class VfsManager(QObject):
         '''
         Walk the VFS after initialization enriching nodes with metadata.
         No need for extra metadata on ISO level nodes since the root
-        directory + system.cnf supplies enough context.
+        directory + system.cnf supplies enough context, this can be adjusted by overriding the
+        source defaults.
         '''
         if not self.enrich_node:
             return
-        logger.warning(f'Enriching initial tree, the children of {self.vfs_root}')
-        for child in self.vfs_root.children:
-            self.enrich_node(child)
-            if child.is_boundary:
-                continue
-            if not child.extension or child.extension == '.bin':
-                self.request_extension.emit(child)
+        with self._lock:
+            for mid, table in self._namespaces.items():
+                if mid == PHYSICAL != self.default:
+                    continue
+                logger.warning(f'Enriching initial tree, the children of {table[()]}')
+                for child in table[()].children:
+                    self.enrich_node(child)
+                    if child.mount_id is not None:
+                        continue
+                    if not child.extension or child.extension == '.bin':
+                        self.request_extension.emit(child)
         logger.debug('VfsManager.enrich_initial_tree: complete')
 
     ###--------------------- Remove -----------------------###
+
+    def _is_anchor(self, node: VfsNode) -> bool:
+        '''The tree root and the mount points of the physical and default namespaces.
+        TODO: update to modular based on init time registered namespaces.'''
+        return node is self.root or node.mount_id in (PHYSICAL, self.default)
+
+    def _drop_namespace(self, node: VfsNode) -> None:
+        '''Removing a root should remove the namespace'''
+        if node.mount_id is not None:
+            self._namespaces.pop(node.mount_id, None)
+            node.mount_id = None
 
     def remove_slotted_node(self, node: VfsNode) -> None:
         '''
         Sentinels this node and delets all children from the tree.
         For keeping the indexes consistent while still clearing data.
         '''
-        if node in (self.root, self.vfs_root) or 'System' in node.category:
+        if self._is_anchor(node) or 'System' in node.category:
             logger.warning(f'Cannot perform slotted removal on crucial system node: {node}')
             return
         with self._lock:
@@ -405,6 +442,7 @@ class VfsManager(QObject):
                     self.remove_start.emit(node, 0, num_children - 1)
                     for child in node.children_snapshot:
                         self._unlink_descendant_recursive(child)
+                self._drop_namespace(node)
                 node.make_sentinel()
                 if num_children > 0:
                     self.remove_finished.emit()
@@ -416,8 +454,9 @@ class VfsManager(QObject):
         Deleted this node's children, and reset this node's expansion state.
         For importing a parent node that already has children so that
         expansion can be run again against the new data.
+        A mount point keeps its namespace so it re-expands into the same mid.
         '''
-        if node is self.root or node is self.vfs_root:
+        if self._is_anchor(node):
             logger.warning(f'Cannot perform children removal on root node: {node}')
             return
         with self._lock, node._lock:
@@ -449,7 +488,7 @@ class VfsManager(QObject):
         can causes issues with indexed lookups. Use remove_slotted_node for
         keeping indexing consistent.
         '''
-        if node in (self.root, self.vfs_root) or 'System' in node.category:
+        if self._is_anchor(node) or 'System' in node.category:
             logger.warning(f'Cannot perform node removal for crucial node: {node}')
             return
         parent=node.parent
@@ -466,40 +505,39 @@ class VfsManager(QObject):
             node.parent = None
             for i in range(row, len(parent.children)):
                 child = parent.children[i]
-                old_hid = child.hierarchical_id
                 child._row = i
-                new_hid = (i,) if parent.is_boundary else parent._id_path + (i,)
+                new_hid = (i,) if parent.mount_id is not None else parent._id_path + (i,)
                 self._rekey_shifted_node(child, new_hid)
             self.remove_finished.emit()
 
-    def _rekey_shifted_node(self, node: VfsNode, new_id_path: tuple[int, ...]) -> None:
+    def _rekey_shifted_node(self, node: VfsNode, new_id_path: Hid) -> None:
         '''
-        Ensure that the iso and vfs hid's stay consistent and keep the required indexes.
-        Shifts the node first then cascades down.
+        Keep the namespace table consistent when a node is reindexed. Shifts the node first
+        then cascades down. A children are relative to the nearest namespace.
         '''
         old_hid = node.hierarchical_id
         if old_hid != new_id_path:
             node._id_path = new_id_path
-            if old_hid in self.vfs_nodes_by_id:
-                self.vfs_nodes_by_id.pop(old_hid)
-                self.vfs_nodes_by_id[new_id_path] = node
-            elif old_hid in self.iso_nodes_by_id:
-                self.iso_nodes_by_id.pop(old_hid)
-                self.iso_nodes_by_id[new_id_path] = node
+            table = self._namespaces[node.mid]
+            if table.get(old_hid) is node:
+                del table[old_hid]
+                table[new_id_path] = node
         for i, child in enumerate(node.children):
-            child_path = (i,) if node.is_boundary else new_id_path + (i,)
+            child_path = (i,) if node.mount_id is not None else new_id_path + (i,)
             self._rekey_shifted_node(child, child_path)
 
     def _unlink_descendant_recursive(self, node: VfsNode) -> None:
         '''
-        Helper to deeply purge descendant nodes from anything held by VfsManager.
+        Helper to deeply purge descendant nodes from anything held by VfsManager and associated namespace.
         Calls node.children directly from inside node._lock, can't use children_snapshot here
         as that introduces a race condiiton.
         '''
         for child in node.children:
             self._unlink_descendant_recursive(child)
-        self.vfs_nodes_by_id.pop(node.hierarchical_id, None)
-        self.iso_nodes_by_id.pop(node.hierarchical_id, None)
+        table = self._namespaces.get(node.mid)
+        if table is not None and table.get(node.hierarchical_id) is node:
+            del table[node.hierarchical_id]
+        self._drop_namespace(node)
         self.physical_offsets.pop(node, None)
 
     ###--------------------- Lookup -----------------------###
@@ -508,49 +546,42 @@ class VfsManager(QObject):
         '''Get physical disk offsets'''
         return self.physical_offsets.get(node, 0)
 
-    def get_vfs_node_by_id(self, hid: tuple[int, ...]) -> VfsNode | None:
-        '''Node lookup for known vfs registered nodes.'''
+    def get_node(self, address: Address) -> VfsNode | None:
+        '''Node lookup for known registered nodes.'''
+        mid, hid = address
         with self._lock:
-            return self.vfs_nodes_by_id.get(hid)
-
-    def get_iso_node_by_id(self, hid: tuple[int, ...]) -> VfsNode | None:
-        '''Node lookup for known iso registered nodes.'''
-        with self._lock:
-            return self.iso_nodes_by_id.get(hid)
+            return self._namespaces.get(mid, {}).get(hid)
 
     ###-------------------- Navigator API ------------------###
 
-    def snapshot_hids(self, hids: list[tuple[int,...]]) -> HidSnapshot:
+    def snapshot_hids(self, addresses: list[Address]) -> HidSnapshot:
         '''Lock-protected snapshot. Return nodes already in the VFS'''
         resolved:   list[VfsNode] =[]
-        unresolved: list[tuple[int,...]] = []
+        unresolved: list[Address] = []
 
         with self._lock:
-            for hid in hids:
-                node = self.vfs_nodes_by_id.get(hid)
+            for address in addresses:
+                node = self.get_node(address)
                 if node:
                     resolved.append(node)
                 else:
-                    unresolved.append(hid)
+                    unresolved.append(address)
 
         return HidSnapshot(resolved, unresolved)
 
-    def find_nearest_ancestor(self, hid: tuple[int,...]) -> VfsNode | None:
-        '''Return the nearest ancestor for an HID, the node that needs expanding'''
+    def find_nearest_ancestor(self, address: Address) -> VfsNode | None:
+        '''Return the nearest registered ancestor for an address, the node that needs expanding'''
+        mid, hid = address
         with self._lock:
+            table = self._namespaces.get(mid)
+            if table is None:
+                return None
             best: VfsNode | None = None
-            for depth in range(1, len(hid)):
-                ancestor = self.vfs_nodes_by_id.get(hid[:depth])
+            for depth in range(len(hid)):
+                ancestor = table.get(hid[:depth])
                 if ancestor:
                     best = ancestor
             return best
-
-    def _find_child_by_path(self, parent: VfsNode, target: tuple[int,...]) -> VfsNode | None:
-        '''Scan children for match. Must be called from _lock.'''
-        for child in parent.children:
-            if child.hierarchical_id == target:
-                return child
-        return None
 
 ###------------------------------------ Status Tracker ---------------------------------------###
 

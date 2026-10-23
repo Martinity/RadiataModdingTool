@@ -6,6 +6,7 @@ Contract map:
     Handlers    BaseHandler > PhysicalHandler / ContainerHandler / LeafHandler
     Editors     BaseEditor  > BaseViewer
     Sources     BaseSource
+                  .Namespaces         source.namespaces.physical / .default / .metadata_of(mid) / .mount_point(node)
                   .Extensions         source.extensions.resolve(node, header)
                   .Packages           source.packages.members(...) / .conflicts(...)
                   .Metadata           source.metadata.path / .entries() / .audit() / .build(store)
@@ -28,11 +29,11 @@ from enum import Flag, Enum, auto
 from pathlib import Path
 from typing import (
     Any, AbstractSet, Callable, cast, Iterator, NamedTuple, TYPE_CHECKING, TypeAlias, runtime_checkable, BinaryIO, Protocol,
-    ClassVar, Sequence
+    ClassVar, Sequence, Mapping
 )
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import pyqtSignal
-from core.node import VfsNode
+from core.node import VfsNode, Address, Mid, PHYSICAL, DEFAULT
 if TYPE_CHECKING:
     from core.workers import TaskHandle, EditorPayload
     from core.native.block_device import BlockDevice
@@ -317,16 +318,16 @@ class BaseEditor(QWidget, metaclass=_ABCMetaQtMeta): # type: ignore
         self.set_dirty(False)
 
     ### Data access
-    def request_payload(self, hid: tuple[int, ...]) -> None:
+    def request_payload(self, address: Address) -> None:
         from core.dispatcher import Dispatcher
         if not isinstance(self._data_resolver, Dispatcher):
             raise TypeError(f'Ensure to set _data_resolver during recieve_data before calling request_payload')
-        self._data_resolver.request_editor_payload(hid, callback=self.receive_request)
+        self._data_resolver.request_editor_payload(address, callback=self.receive_request)
 
-    def request_raw_data(self, hid: tuple[int, ...]) -> None:
+    def request_raw_data(self, address: Address) -> None:
         if not self._data_resolver:
             raise TypeError(f'Ensure to set _data_resolver during recieve_data before calling request_raw_data')
-        self._data_resolver.request_raw_data(hid, callback=self.receive_request)
+        self._data_resolver.request_raw_data(address, callback=self.receive_request)
 
     def current_data(self) -> Any:
         '''Return the live state'''
@@ -807,6 +808,7 @@ class BaseSource(abc.ABC):
 
     Components (nested classes, one instance per source via source.<lowercase name>):
 
+        class Namespaces    source.namespaces.physical / .default / .metadata_of(mid) / .mount_point(node)
         class Extensions    source.extensions.resolve(node, header)
         class Packages      source.packages.members(...) / .conflicts(...)
         class Metadata      source.metadata.build(store)
@@ -823,7 +825,7 @@ class BaseSource(abc.ABC):
     runtime_file_names: ClassVar[frozenset[str]] = frozenset()
     build_hashes:       ClassVar[dict[str, str]] = {}
     metadata_path:      ClassVar[str] = ''
-    builder:            ClassVar[type[BaseSource.Builder] | None] = None  # Set automatically by `Builder`
+    builder:            ClassVar[type[BaseSource.Builder]]
 
     signature:             ClassVar[bytes] = b''
     signature_offset:      ClassVar[int] = 0x28
@@ -836,7 +838,7 @@ class BaseSource(abc.ABC):
     Geometry: TypeAlias = SourceGeometry
     TocEntry: TypeAlias = TocEntry
 
-    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches', 'Builder')
+    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Namespaces', 'Metadata', 'Patches', 'Builder')
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         '''Validate and derive the components a source declares'''
@@ -852,7 +854,7 @@ class BaseSource(abc.ABC):
             declared = cls.__dict__.get(name)
             if declared is not None and not (isinstance(declared, type) and issubclass(declared, getattr(BaseSource, name))):
                 raise TypeError(f'{cls.__name__}.{name} must subclass BaseSource.{name}: write `class {name}(BaseSource.{name}):`.')
-        cls.builder = cls.Builder if cls.Builder is not BaseSource.Builder else None
+        cls.builder = cls.Builder
         cls.metadata_path = cls.Metadata.path
 
     def __repr__(self) -> str:
@@ -890,21 +892,6 @@ class BaseSource(abc.ABC):
         '''Process the toc into valid data. Only necesarry if the TOC is not plain bytes'''
         return flat_toc
 
-    ### Tree
-    def resolve_boundary(self, root: VfsNode) -> VfsNode:
-        '''Return the node that represents the boundary between the VFS and the ISO.
-        Currently only supports a single boundary node.
-        Default: scan the root node's children for `.is_boundary`'''
-        if root.children and root.children[-1].is_boundary:
-            return root.children[-1]
-        for child in root.children:
-            if child.is_boundary:
-                return child
-        boundary = VfsNode()
-        boundary.is_boundary = True
-        root.append_child(boundary)
-        return boundary
-
     ###-------------------- Components --------------------###
 
     class Component:
@@ -931,13 +918,13 @@ class BaseSource(abc.ABC):
         class Member:
             '''A single reguired node of a package'''
             role:     str
-            hid:      tuple[int, ...]
+            address:  Address
             required: bool = True
         @runtime_checkable
         class LinkLookup(Protocol):
             '''Resolves links between nodes required to resolve a package
             Satisfied by metadata.'''
-            def link_of(self, hid: tuple[int, ...]) -> tuple[int, ...] | None: ...
+            def link_of(self, address: Address) -> Address | None: ...
         @dataclass(frozen=True, slots=True)
         class Finding:
             '''One source-defined filesystem conflic.
@@ -951,16 +938,47 @@ class BaseSource(abc.ABC):
         def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[Finding]:
             '''Returns the conflicts between the incoming node and the pending nodes.
             Default: a node and the node it links with have independent pending edits.'''
-            hid        = incoming.hierarchical_id
-            header_hid = links.link_of(hid)
+            address           = incoming.address
+            dependent_address = links.link_of(address)
             findings: list[BaseSource.Packages.Finding] = []
             for other in pending:
-                other_hid = other.hierarchical_id
-                if header_hid is not None and other_hid == header_hid:
+                other_address = other.address
+                if dependent_address is not None and other_address == dependent_address:
                     findings.append(self.Finding(other, f'{incoming} depends on header from {other} which has pending modifications'))
-                elif links.link_of(other_hid) == hid:
+                elif links.link_of(other_address) == address:
                     findings.append(self.Finding(other, f'{other} depends on header from {incoming} which has pending modifications'))
             return findings
+
+    class Namespaces(Component):
+        ''''''
+        physical: ClassVar[Mid] = PHYSICAL
+        default:  ClassVar[Mid] = DEFAULT
+        metadata: ClassVar[Mapping[Mid, type[BaseSource.Metadata]]] = {}
+
+        def metadata_of(self, mid: Mid) -> BaseSource.Metadata | None:
+            '''The metadata that names the nodes of namespace mid or None if it has None'''
+            declared = self.metadata.get(mid)
+            if declared is None:
+                return self.source.metadata if mid == self.default else None
+            return declared(self.source)
+
+        def mount_point(self, node: VfsNode) -> Mid | None:
+            '''Called for each node as it appears. Return the id of the namespace it roots, else None.'''
+            return None
+
+        @classmethod
+        def validate(cls, source: type[BaseSource]) -> None:
+            name = source.__name__
+            for attr in ('physical', 'default'):
+                value = getattr(cls, attr)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise TypeError(f'{name}.Namespaces.{attr} must be an int >= 0, got {value!r}.')
+                for mid, metadata in cls.metadata.items():
+                    if not isinstance(mid, int) or isinstance(mid, bool) or mid < 0:
+                        raise TypeError(f'{name}.Namespaces.metadata key {mid!r} must be and int >= 0.')
+                    if not (isinstance(metadata, type) and issubclass(metadata, BaseSource.Metadata)):
+                        raise TypeError(f'{name}.Namespaces.metadata[{mid}] must be a BaseSource.Metadata subclass, got {metadata!r}.')
+                    metadata.validate(source)
 
     class Metadata(Component):
         '''
@@ -1136,16 +1154,16 @@ class BaseSource(abc.ABC):
 
             Must implement:
                 action      the handler action name
-                hid         hierarchical id of the node to apply the patch to
+                address     (mid, hid) of the node to apply the patch to
             '''
             is_physical: ClassVar[bool] = False
             action:      ClassVar[str]
-            hid:         ClassVar[tuple[int, ...]]
+            address:     ClassVar[Address]
 
             def check(self, rebuild_flags: type[SourceRebuildFlags]) -> None:
                 super().check(rebuild_flags)
-                if not (hasattr(self, 'action') and hasattr(self, 'hid')):
-                    raise TypeError(f'{type(self).__name__}: delegated patches must define both `action` and `hid`.')
+                if not (hasattr(self, 'action') and hasattr(self, 'address')):
+                    raise TypeError(f'{type(self).__name__}: delegated patches must define both `action` and `address`.')
 
         all_patches: ClassVar[tuple[BasePatch, ...]] = ()
 
@@ -1254,42 +1272,45 @@ class BaseSource(abc.ABC):
         def __init__(
             self,
             *,
-            source:      BaseSource,
-            handle:      BlockDevice,
-            source_root: VfsNode,
-            vfs_root:    VfsNode,
-            staged:      frozenset[VfsNode],
-            flags:       SourceRebuildFlags,
-            toc:         list[TocEntry],
-            pvd:         RootDirectoryStructure,
-            gap_nodes:   list[VfsNode],
-            log:         Callable[[str], None] | None = None,
+            source: BaseSource,
+            handle: BlockDevice,
+            log:    Callable[[str], None] | None = None,
         ) -> None:
-            self.source      = source
-            self.geometry    = source.geometry
-            self.handle      = handle
-            self.source_root = source_root
-            self.vfs_root    = vfs_root
-            self.staged      = staged
-            self.flags       = flags
-            self.toc         = toc
-            self.pvd         = pvd
-            self.gap_nodes   = gap_nodes
-            self.log         = log or (lambda message: None)
+            self.source   = source
+            self.geometry = source.geometry
+            self.handle   = handle
+            self.log      = log or (lambda message: None)
 
+            self.staged: frozenset[VfsNode] = frozenset()
+            self.flags:  SourceRebuildFlags = cast(Any, source.rebuild_flags).NONE
+            self._reset_layout()
+
+        def _reset_layout(self) -> None:
             self.planner: DiskLayoutPlanner = DiskLayoutPlanner()
             self.named:   dict[str, DiskRegion] = {}
             self.rebuild_context = RebuildContext(regions=self.named, sector_size=self.geometry.sector_size)
-
-            self.patch_plan = source.patches.plan(handle, flags)
+            self.patch_plan = self.source.patches.plan(self.handle, self.flags)
 
         ### Contract
+        @abc.abstractmethod
+        def build_tree(self) -> VfsNode:
+            '''Read the source into a VfsNode tree and return its root.'''
+
         @abc.abstractmethod
         def build_layout(self) -> None:
             '''subclasses must implement this method to build the layout, by calling self.add_region() sequentially'''
 
         ### Entrypoint
-        def build(self, dst: BinaryIO, task_handle: TaskHandle, progress_every: int = 1) -> int:
+        def build(
+            self,
+            dst:            BinaryIO,
+            task_handle:    TaskHandle,
+            *,
+            staged:         frozenset[VfsNode],
+            flags:          SourceRebuildFlags,
+            handle:         BlockDevice | None = None,
+            progress_every: int = 1
+        ) -> int:
             '''Plan, resolve and write a new source. Returns the number of bytes written.'''
             self.build_layout()
             self.log(f'Resolving physical disk layout offsets for {len(self.planner.regions)} regions')
@@ -1322,6 +1343,21 @@ class BaseSource(abc.ABC):
                 return member is not None and bool(self.flags & member)
             return bool(self.flags & flag)
 
+        ### Tree helper
+        def resolve_boundary(self, root: VfsNode) -> VfsNode:
+            '''Return the node that represents the boundary between the VFS and the ISO.
+            Currently only supports a single boundary node.
+            Default: scan the root node's children for `.is_boundary`'''
+            if root.children and root.children[-1].is_boundary:
+                return root.children[-1]
+            for child in root.children:
+                if child.is_boundary:
+                    return child
+            boundary = VfsNode()
+            boundary.is_boundary = True
+            root.append_child(boundary)
+            return boundary
+
     ### Component Access
     @cached_property
     def extensions(self) -> Extensions:
@@ -1330,6 +1366,10 @@ class BaseSource(abc.ABC):
     @cached_property
     def packages(self) -> Packages:
         return self.Packages(self)
+
+    @cached_property
+    def namespaces(self) -> Namespaces:
+        return self.Namespaces(self)
 
     @cached_property
     def metadata(self) -> Metadata:
@@ -1341,8 +1381,6 @@ class BaseSource(abc.ABC):
 
     def create_builder(self, **kwargs: Any) -> Builder:
         '''Instantiate this source's Builder'''
-        if self.builder is None:
-            raise NotImplementedError(f'{self.__class__.__name__} does not define a Builder.')
         return self.builder(source=self, **kwargs)
 
     ### Registration check
@@ -1363,7 +1401,7 @@ class BaseSource(abc.ABC):
         none_flag = cls.rebuild_flags.__members__.get('NONE')
         if none_flag is None or none_flag.value != 0:
             raise TypeError(f'{name}.rebuild_flags must define NONE = 0 (the no-patch flag).')
-        for attr in ('extensions', 'packages', 'metadata', 'patches'):
+        for attr in ('extensions', 'packages', 'namespace', 'metadata', 'patches'):
             if not isinstance(inspect.getattr_static(cls, attr), cached_property):
                 raise TypeError(f'{name}.{attr} is reserved for the component instance; declare `class {attr.capitalize()}:` instead.')
         for attr in BaseSource.COMPONENTS:
@@ -1372,7 +1410,9 @@ class BaseSource(abc.ABC):
             if not (isinstance(component, type) and issubclass(component, base)):
                 raise TypeError(f'{name}.{attr} must be a class that subclasses BaseSource.{attr}, got {component!r}.')
             if attr == 'Builder':
-                if component is not base and inspect.isabstract(component):
+                if component is base:
+                    raise TypeError(f'{name} must define `class Builder(BaseSource.Builder)`. Tree and Layout and source specific.')
+                if inspect.isabstract(component):
                     raise TypeError(f'{name}.Builder is abstract; implement {sorted(component.__abstractmethods__)}.')
             else:
                 cast(Any, component).validate(cls)

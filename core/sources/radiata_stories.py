@@ -10,7 +10,7 @@ from struct import unpack_from
 from enum import auto
 
 from core.registry import Registry
-from core.contracts import BaseSource, TocEntry
+from core.contracts import BaseSource, TocEntry, RootDirectoryStructure
 from core.handlers.kods_container import HEADER_ROLE, slot_header_role
 from core.extension_overrides import lookup_extension
 from core.node import VfsNode
@@ -18,6 +18,9 @@ from core.node import VfsNode
 if TYPE_CHECKING:
     from core.metadata_manager import StaticMetadataSource
     from core.native.block_device import BlockDevice
+
+import logging
+logger = logging.getLogger(f'radiata.{__name__}')
 
 _GEOMETRY = BaseSource.Geometry(sector_size=0x800, iso_9660_pvd=16, pvd_byte_offset=0x9C)
 _RUNTIME_REQUIRED_FILES = {'IOPRP300', 'SYSTEM'}
@@ -2462,8 +2465,7 @@ class RadiataStoriesSource(BaseSource):
     ### Identification
     def matches(self, handle: BlockDevice) -> bool:
         offset = (self.geometry.iso_9660_pvd * self.geometry.sector_size) + self.signature_offset
-        peek = handle.pread(offset, len(self.signature))
-        return peek == self.signature
+        return handle.pread(offset, len(self.signature)) == self.signature
 
     def validate_filesystem(self, root_children: list[VfsNode]) -> None:
         found_names = {child.name for child in root_children}
@@ -2576,6 +2578,120 @@ class RadiataStoriesSource(BaseSource):
         tree reminder: self.source_root is the PHYSICAL tree (executable, SYSTEM, ... plus the boundary node),
         self.vfs_root is the boundary node whose children are the TOC derived virtual files.'''
 
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.pvd: RootDirectoryStructure | None = None
+            self.toc: list[TocEntry] = []
+            self.toc_lba: int = -1
+            self.cnf: tuple[int, int] | None = None
+            self.system_areas: VfsNode = VfsNode()
+
+        @property
+        def gap_nodes(self) -> list[VfsNode]:
+            '''Unreferenced areas between the root directory and the files that folow it, sequentially'''
+            return list(self.system_areas.children[2:])
+
+        ###------------------------------- Tree ------------------------------------###
+
+        def build_tree(self) -> VfsNode:
+            self.system_areas = VfsNode()
+            self.cnf = None
+            self.source_root = self._read_root_directory()
+            self.vfs_root = self.resolve_boundary(self.source_root)
+            self.toc_lba = self.source.locate_toc(self.source_root, self.handle)
+            self.toc = self.source.decode_toc(self.handle, self.toc_lba)
+            self._read_toc_nodes()
+            return self.source_root
+
+        def _read_root_directory(self) -> VfsNode:
+            '''Returns the root node of the ISO directory tree containing all files.'''
+            if not self.source.matches(self.handle):
+                raise ValueError(
+                    f'Source does not match the signature expected for source {self.source.__class__.__name__!r}'
+                )
+            root = VfsNode(name='root')
+            # Read descriptor volume for root dir location
+            offset  = (self.geometry.iso_9660_pvd * self.geometry.sector_size) + self.geometry.pvd_byte_offset
+            pvd_len = self.handle.pread(offset, 1)[0]
+            self.system_areas.append_child(VfsNode(name='System Area 1', offset=0, size=offset))
+            self.pvd = RootDirectoryStructure.from_bytes(self.handle.pread(offset, pvd_len), self.geometry.sector_size)
+            self.system_areas.append_child(VfsNode(name='System Area 2', offset=offset + pvd_len, size=self.pvd.lba))
+            # Read root dir for files
+            bytes_read = 0
+            root_dir_view = memoryview(self.handle.pread(self.pvd.lba, self.pvd.file_size))
+            logger.debug(f'PVD file size: {self.pvd.file_size}')
+            while bytes_read < self.pvd.file_size:
+                entry_length = root_dir_view[bytes_read]
+                bytes_read  += 1
+                if not entry_length:
+                    break
+                record_slice = root_dir_view[bytes_read - 1 : bytes_read - 1 + entry_length]
+                bytes_read += entry_length - 1
+                record = RootDirectoryStructure.from_bytes(record_slice.tobytes(), self.geometry.sector_size)
+                if record.file_name in ('.', '..'): # Skip self-references
+                    continue
+                name, sep, ext = record.file_name.rpartition('.')
+                node = VfsNode(
+                    name=name,
+                    category=('ISO',),
+                    extension=sep + ext,
+                    offset=record.lba,
+                    size=record.file_size,
+                    parent=root,
+                    target=None,
+                )
+                node.is_physical = True
+                root.append_child(node)
+                if ext == 'CNF':
+                    self.cnf = (record.lba * self.geometry.sector_size, record.file_size)
+
+            # ISO Integrity Check
+            self.source.validate_filesystem(root.children)
+
+            # Root directory to end of ISO filesystem system areas - for rebuilding
+            pos = self.pvd.lba + self.pvd.file_size
+            for node in sorted(root.children, key=lambda node: node.offset):
+                gap = node.offset - pos
+                if gap > 0:
+                    self.system_areas.append_child(VfsNode(name=f'AreaBefore{node.name}', size=gap, offset=pos))
+                pos = max(pos, node.offset + node.size)
+            return root
+
+        def _read_toc_nodes(self) -> None:
+            '''Returns the root node of the VFS (the toc/gameassets)'''
+            logger.debug('Building VFS tree from TOC')
+            root = self.vfs_root
+
+            for entry in self.toc:
+                disk_index = entry.id
+                # Sentinel nodes
+                if entry.size == 0:
+                    sentinel = VfsNode(
+                        name=f'sentinel {disk_index}',
+                        offset=-1,
+                        size=-1,
+                        parent=root,
+                    )
+                    sentinel.is_hidden = True
+                    sentinel.logical_id = entry.logical_id
+                    root.append_child(sentinel)
+                    continue
+                # Valid nodes
+                node = VfsNode(
+                    name='Unknown',
+                    category=('',),
+                    offset=entry.offset,
+                    size=(entry.size * self.geometry.sector_size),
+                    parent=root,
+                    target=None,
+                )
+                node.is_physical = True
+                node.logical_id = entry.logical_id
+                root.append_child(node)
+                if disk_index in self.source.hidden_toc_indices:  # Hide file system nodes
+                    node.is_hidden = True
+            logger.info(f'Tree built - {len(root.children)} total files - {sum(1 for valid in root.children if valid.is_hidden is True)} hidden files')
+
         def build_layout(self) -> None:
             self._emit_prologue()
             self._emit_runtime_files()
@@ -2586,6 +2702,8 @@ class RadiataStoriesSource(BaseSource):
         def _emit_prologue(self) -> None:
             '''System area, PVD record, area up to the root directory, then the root directory itself.'''
             R, geo = self.Regions, self.geometry
+            if self.pvd is None:
+                raise ValueError('PVD not found, build_tree must run before build_layout.')
             sys_area_1_len = (geo.iso_9660_pvd * geo.sector_size) + geo.pvd_byte_offset
             self.add_region(R.RawCopy(0, sys_area_1_len, 'System Area', self.handle))
             self.add_region(R.RawCopy(sys_area_1_len, self.pvd.entry_length, 'PVD Record', self.handle))

@@ -2779,14 +2779,6 @@
     ],
     "extension": null
   },
-  "186.500.1": {
-    "title": "Starting FMV / Coliseum Waiting Room",
-    "description": "",
-    "tags": [
-      "Script"
-    ],
-    "extension": null
-  },
   "186.500.2": {
     "title": "Pre Ridley Battle",
     "description": "",
@@ -3885,14 +3877,6 @@
   },
   "186.802": {
     "title": "Debug Room",
-    "description": "",
-    "tags": [
-      "Script"
-    ],
-    "extension": null
-  },
-  "186.803": {
-    "title": "Transpiritation FMV (Game Engine)",
     "description": "",
     "tags": [
       "Script"
