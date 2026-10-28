@@ -13,7 +13,7 @@ from core.registry import Registry
 from core.contracts import BaseSource, TocEntry, RootDirectoryStructure
 from core.handlers.kods_container import HEADER_ROLE, slot_header_role
 from core.extension_overrides import lookup_extension
-from core.node import VfsNode
+from core.node import VfsNode, PHYSICAL
 
 if TYPE_CHECKING:
     from core.metadata_manager import StaticMetadataSource
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
 
+VFS_MID = 1
 _GEOMETRY = BaseSource.Geometry(sector_size=0x800, iso_9660_pvd=16, pvd_byte_offset=0x9C)
 _RUNTIME_REQUIRED_FILES = {'IOPRP300', 'SYSTEM'}
 _RUNTIME_EXECUTABLE_CANDIDATES = {'SLUS_212', 'SLPM_658'}
@@ -1629,17 +1630,17 @@ class DatacenterTargets:
         return None
 
     @classmethod
-    def to_hid_str_map(cls):
+    def to_link_map(cls):
         '''Used to export and repopulate metadata with target_hids
-        yields hid string representations mapped to flat integer tuples'''
+        yields each node's address string representations mapped to flat integer tuples'''
         for disk_idx, hid in cls._TARGET_STATIC.items():
-            yield str(disk_idx), hid
+            yield (disk_idx,), hid
         for start, end, prefix, steps in cls._TARGET_MAP:
             for disk_idx in range(start, end):
                 base = (disk_idx - start) * steps
-                yield str(disk_idx), prefix + (base,)
+                yield (disk_idx,), prefix + (base,)
                 for child_idx in range(steps -1):
-                    yield f'{disk_idx}.{child_idx}', prefix + (base + 1 + child_idx,)
+                    yield (disk_idx, child_idx), prefix + (base + 1 + child_idx,)
 
 class PhysicalFileCategories:
     _CATEGORIES = {
@@ -2247,7 +2248,7 @@ class TextureBanks:
         "Panic Powder", "Mass of Enmity", "Cement Powder", "Tsuchinoko Dumpling", "Flee Ball", "Analysis Ball",
         "Celestial Nectar", "Holy Sword Gram", "Seraphic Garb", "Evening Bloom", "David's Letter",
         "Carlos's Contact Lens", "Faraus's Med/Voynich Book", "Key to Repository", "Man's Picture", "Church Bulletin", "Worn Belt",
-        "Lulu's Cat", "Matango Larva", "Gobpakken Seed", "Pointura's Thread", "Blood Orc's Horn" "Collection Bag",
+        "Lulu's Cat", "Matango Larva", "Gobpakken Seed", "Pointura's Thread", "Blood Orc's Horn", "Collection Bag",
         "Bridge Blueprints", "Piglet", "King's Toadstool", "Polpo's Soup", "Tria Milk", "Bligh's Pipe",
         "Deathclover Larva", "Nightstone", "Blue Orb", "Green Orb", "Red Orb", "Purple Orb", "Orb",
         "Smilodon's Fang", "Crocogator's Skin", "Arbitrator", "Boundary Crest", "Recruitment Flyer",
@@ -2357,7 +2358,6 @@ class TextureBanks:
                 'tags': ('Texture', 'FIS')
             }
         # Metadata for Texture Bank 10
-        (cls._RANGE10, cls._BANK10)
         disk_idx = cls._RANGE10
         for child_idx, data in cls._BANK10.items():
             yield f'{disk_idx}.{child_idx}', {
@@ -2365,10 +2365,17 @@ class TextureBanks:
                 'description': data.get('description'),
                 'tags': ('Texture', 'FIS')}
 
-_STATIC_METADATA_SOURCES: list[StaticMetadataSource] = [
-    PhysicalFileCategories, PhysicalFileNames, EntityPackSections, MapSections,
-    IOPModules, EventScripts, CharaPortraits, TextureBanks
+_STATIC_METADATA_SOURCES: list[tuple[int, StaticMetadataSource]] = [
+    (VFS_MID, source) for source in (
+        PhysicalFileCategories, PhysicalFileNames, EntityPackSections, MapSections,
+        IOPModules, EventScripts, CharaPortraits, TextureBanks,
+    )
 ]
+
+def _datacenter_entries():
+    '''Every node with a datacenter header is linked, (Address, fields)'''
+    for hid, header_hid in DatacenterTargets.to_link_map():
+        yield (VFS_MID, hid), {'links': ((VFS_MID, header_hid),), 'extension': '.kods'}
 
 ###---------------------------------------- Packages ---------------------------------------------###
 
@@ -2396,13 +2403,17 @@ class RadiRebuildFlags(BaseSource.Flags):
     SLIMMED           = auto()
     CUTSCENE_SKIPPER  = auto()
 
+def _executables(all_nodes: list[VfsNode]) -> list[VfsNode]:
+    '''Return the physical namespace for patching'''
+    return [n for n in all_nodes if n.mid == PHYSICAL and (n.name or '').startswith(('SLUS', 'SLPM'))]
+
 class TocOffsetPatch(BaseSource.Patches.BasePhysicalPatch):
     '''Ensures default TOC offset.'''
     name    = 'default build'
     flag    = RadiRebuildFlags.NONE
 
     def candidate_selector(self, all_nodes: list[VfsNode]) -> list[VfsNode]:
-        return [n for n in all_nodes if not n.is_boundary and (n.name or '').startswith(('SLUS', 'SLPM'))]
+        return _executables(all_nodes)
 
     def locate(self, raw_data: bytes) -> int | None:
         return _find_masked_immediate(raw_data)
@@ -2419,7 +2430,7 @@ class CutsceneSkipperPatch(BaseSource.Patches.BaseVirtualPatch):
     flag        = RadiRebuildFlags.CUTSCENE_SKIPPER
     description = 'Skips cutscenes by force terminating them near-instantly.'
     action      = 'Skip cutscenes'
-    hid         = (186,)
+    address     = (VFS_MID, (186,))
 
 class SlimmedPatch(BaseSource.Patches.BasePhysicalPatch):
     '''Marker patch for the SLIMMED option.'''
@@ -2428,7 +2439,7 @@ class SlimmedPatch(BaseSource.Patches.BasePhysicalPatch):
     description = 'Saves 1GB of space by removing non-essential runtime data.'
 
     def candidate_selector(self, all_nodes: list[VfsNode]) -> list[VfsNode]:
-        return [n for n in all_nodes if not n.is_boundary and (n.name or '').startswith(('SLUS', 'SLPM'))]
+        return _executables(all_nodes)
 
     def locate(self, raw_data: bytes) -> int | None:
         return _find_masked_immediate(raw_data)
@@ -2449,7 +2460,12 @@ _KNOWN_BUILDS: dict[str, str] = {
 
 @Registry.register_source
 class RadiataStoriesSource(BaseSource):
-    '''Radiata Stories (PS2): ISO9660'''
+    '''Radiata Stories (PS2): ISO9660 + a TOC derived virtual filesystem
+
+    Two roots:
+        PHYSICAL    the ISO 9660 root directory
+        VFS         the game's own file table
+    '''
     display_name          = 'Radiata Stories'
     build_hashes          = _KNOWN_BUILDS
     geometry              = _GEOMETRY
@@ -2476,7 +2492,6 @@ class RadiataStoriesSource(BaseSource):
 
     ### TOC
     def locate_toc(self, root: VfsNode, handle: BlockDevice) -> int:
-        self.resolve_boundary(root)
         boot = next((node for node in root.children if node.name in self.executable_candidates), None)
         if not boot:
             raise ValueError('No boot executable found, cannot open source.')
@@ -2529,6 +2544,193 @@ class RadiataStoriesSource(BaseSource):
             flat[(total * 2) + i] = entry.logical_id
         return struct.pack(f'<{total * 3}I', *self.scramble_toc(flat))
 
+    ### Tree + Namespaces
+    def build_tree(self, handle: BlockDevice, root: VfsNode, toc: list[TocEntry]) -> BaseSource.Tree:
+        '''assign the namespaces for the physical and vfs layers'''
+        tree = self.Tree(root)
+        vfs  = tree.mount(VFS_MID, label='VFS', default=True)
+        for entry in toc:
+            vfs.append_child(self._toc_node(entry, vfs))
+        hidden = sum(1 for child in vfs.children if child.is_hidden)
+        logger.info(f'Tree built - {len(vfs.children)} total files - {hidden} hidden files')
+        return tree
+
+    def _toc_node(self, entry: TocEntry, parent: VfsNode) -> VfsNode:
+        if entry.size == 0:  # Sentinels
+            node = VfsNode(name=f'sentinel {entry.id}', offset=-1, size=-1, parent=parent)
+            node.is_hidden = True
+            node.logical_id = entry.logical_id
+            return node
+        node = VfsNode(
+            name='Unknown',
+            category=('',),
+            offset=entry.offset,
+            size=(entry.size * self.geometry.sector_size),
+            parent=parent,
+        )
+        node.is_physical = True
+        node.logical_id = entry.logical_id
+        if entry.id in self.hidden_toc_indices: # Hide file system nodes
+            node.is_hidden = True
+        return node
+
+    def read_iso(self, handle: BlockDevice) -> tuple[VfsNode, RootDirectoryStructure, list[VfsNode]]:
+        if not self.matches(handle):
+            raise ValueError(f'Source does not match the signature expected for source {type(self).__name__!r}')
+        root = VfsNode(name='root')
+        system_areas = VfsNode()
+        # Read descriptor volume for root dir location
+        offset  = (self.geometry.iso_9660_pvd * self.geometry.sector_size) + self.geometry.pvd_byte_offset
+        pvd_len = handle.pread(offset, 1)[0]
+        system_areas.append_child(VfsNode(name='System Area 1', offset=0, size=offset))
+        pvd = RootDirectoryStructure.from_bytes(handle.pread(offset, pvd_len), self.geometry.sector_size)
+        system_areas.append_child(VfsNode(name='System Area 2', offset=offset + pvd_len, size=pvd.lba - (offset + pvd_len)))
+        # Read root dir for files
+        bytes_read = 0
+        root_dir_view = memoryview(handle.pread(pvd.lba, pvd.file_size))
+        logger.debug(f'PVD file size: {pvd.file_size}')
+        while bytes_read < pvd.file_size:
+            entry_length = root_dir_view[bytes_read]
+            bytes_read  += 1
+            if not entry_length:
+                break
+            record_slice = root_dir_view[bytes_read - 1 : bytes_read - 1 + entry_length]
+            bytes_read += entry_length - 1
+            record = RootDirectoryStructure.from_bytes(record_slice.tobytes(), self.geometry.sector_size)
+            if record.file_name in ('.', '..'): # Skip self-references
+                continue
+            name, sep, ext = record.file_name.rpartition('.')
+            node = VfsNode(
+                name=name,
+                category=('ISO',),
+                extension=sep + ext,
+                offset=record.lba,
+                size=record.file_size,
+                parent=root,
+            )
+            node.is_physical = True
+            root.append_child(node)
+
+        # ISO Integrity Check
+        self.validate_filesystem(root.children)
+
+        # Root directory to end of ISO filesystem system areas - for rebuilding
+        pos = pvd.lba + pvd.file_size
+        for node in sorted(root.children, key=lambda node: node.offset):
+            gap = node.offset - pos
+            if gap > 0:
+                system_areas.append_child(VfsNode(name=f'AreaBefore{node.name}', size=gap, offset=pos))
+            pos = max(pos, node.offset + node.size)
+        return root, pvd, list(system_areas.children[2:])
+
+    ### Rebuild
+    def build_layout(self, rebuild: BaseSource.Rebuild) -> None:
+        self._emit_prologue(rebuild)
+        self._emit_runtime_files(rebuild)
+        self._emit_toc_placement(rebuild)
+        self._emit_toc_table(rebuild)
+        self._emit_vfs_payload(rebuild)
+
+    def _emit_prologue(self, rebuild: BaseSource.Rebuild) -> None:
+        '''System area, PVD record, area up to the root directory, then the root directory itself.'''
+        R, geo, pvd, handle = self.Regions, self.geometry, rebuild.pvd, rebuild.handle
+        if pvd is None:
+            raise ValueError('PVD not found, build_tree must run before build_layout.')
+        sys_area_1_len = (geo.iso_9660_pvd * geo.sector_size) + geo.pvd_byte_offset
+        rebuild.add_region(R.RawCopy(0, sys_area_1_len, 'System Area', handle))
+        rebuild.add_region(R.RawCopy(sys_area_1_len, pvd.entry_length, 'PVD Record', handle))
+        pvd_end = sys_area_1_len + pvd.entry_length
+        rebuild.add_region(R.RawCopy(pvd_end, pvd.lba - pvd_end, 'System Area 2', handle))
+        rebuild.add_region(R.RootDirectory(
+            fixed_size=pvd.file_size,
+            sector_size=geo.sector_size,
+            original_bytes=handle.pread(pvd.lba, pvd.file_size),
+            keep_unmatched=False,
+        ), name='root_dir')
+
+    def _emit_runtime_files(self, rebuild: BaseSource.Rebuild) -> None:
+        '''Runtime ISO files (IOPRP300, SYSTEM, executable) and the gaps between them, in disk order,
+        each registered in the root directory. The executable must receive the TOC offset patch.'''
+        R = self.Regions
+        root_dir = rebuild.named.get('root_dir')
+        if not isinstance(root_dir, R.RootDirectory):
+            raise ValueError('root directory region missing, _emit_prologue must run first')
+        nodes = [child for child in rebuild.source_root.children if child.mount_id is None] # Everything but the namespace mount-points
+        nodes += rebuild.gap_nodes
+        nodes.sort(key=lambda node: node.offset)
+        suffixes = tuple(self.runtime_file_names)
+        patched = False
+        exec_names: list[str] = []
+        for node in nodes:
+            if not node.name.endswith(suffixes):
+                continue
+            if node.name.startswith('AreaBefore'):
+                rebuild.add_region(R.RawCopy(node.offset, node.size, node.name, rebuild.handle))
+                continue
+            region: BaseSource.Regions.Region
+            is_exec = node.name.startswith(('SLUS', 'SLPM'))
+            patcher = rebuild.patcher_for(node)
+            if patcher:
+                region = R.BinaryPatch(node, rebuild.handle, self.geometry.sector_size, patcher=patcher)
+                patched = True
+            elif node in rebuild.staged and node.pending_data is not None:
+                region = R.StagedData(node, self.geometry.sector_size)
+            else:
+                region = R.RawCopy(node.offset, node.size, node.name, rebuild.handle)
+            if is_exec:
+                exec_names.append(f'{node.name} (patch sites={rebuild.patch_plan.describe(node)!r})')
+            rebuild.add_region(region)
+            root_dir.front_section_entries.append((node, region))
+        if not patched:
+            raise ValueError(
+                'The executable received no TOC offset patch. '
+                f'Executable nodes seen: {exec_names or "none"}; '
+                f'active physical patches: {[type(p).__name__ for p in rebuild.patch_plan.active]}; '
+                f'slimmed={rebuild.has_flag("SLIMMED")}'
+            )
+
+    def _emit_toc_placement(self, rebuild: BaseSource.Rebuild) -> None:
+        '''Padding between the ISO filesystem and the TOC. Normally pads to the TOC LBA the executable
+        expects. With SLIMMED it only sector-aligns so the TOC follows immediately, and the executable
+        patch carries the new LBA.'''
+        R, sector = self.Regions, self.geometry.sector_size
+        if rebuild.has_flag('SLIMMED'):
+            rebuild.add_region(R.Align(sector, 'TOC_alignment_padding'), name='toc_padding')
+        else:
+            rebuild.add_region(R.PadToLba(_FIXED_TOC_LBA, sector, 'TOC_offset_Padding'), name='toc_padding')
+
+    def _emit_toc_table(self, rebuild: BaseSource.Rebuild) -> None:
+        '''The scrambled TOC. Entries are filled by _emit_vfs_payload, so this must come before it.'''
+        rebuild.add_region(self.Regions.Toc(
+            total_entries=self.toc_total_entries,  # changing this means the executable must be patched too
+            sector_size=self.geometry.sector_size,
+            scramble_fn=self.scramble_toc,
+        ), name=_TOC_REGION)
+
+    def _emit_vfs_payload(self, rebuild: BaseSource.Rebuild) -> None:
+        '''VFS data, one sector aligned region per node, recorded in the TOC. TOC slot 0 describes the
+        TOC itself (no region); sentinels are zero size entries.'''
+        R = self.Regions
+        toc_region = rebuild.named.get(_TOC_REGION)
+        if not isinstance(toc_region, R.Toc):
+            raise ValueError('TOC region missing, _emit_toc_table must run first')
+        sector = self.geometry.sector_size
+        for idx, child in enumerate(rebuild.roots[VFS_MID].children):
+            if idx == 0:  # self-reference
+                toc_region.entries.append((child, toc_region))
+                continue
+            orig_lba = rebuild.toc[idx].lba if idx < len(rebuild.toc) else 0
+            if (child.size == -1 and child not in rebuild.staged) or orig_lba in _SENTINEL_LBAS:
+                toc_region.entries.append((child, R.Sentinel(child)))
+                continue
+            region: BaseSource.Regions.Region
+            if child in rebuild.staged and child.pending_data is not None:
+                region = R.StagedData(child, sector)
+            else:
+                region = R.RawCopy(child.offset, child.size, child.name, rebuild.handle)
+            toc_region.entries.append((child, region))
+            rebuild.add_region(region, alignment=sector)
+
     ###------------------- Components ---------------------------###
 
     class Extensions(BaseSource.Extensions):
@@ -2536,6 +2738,8 @@ class RadiataStoriesSource(BaseSource):
             node.extension = lookup_extension(header)
             if node.extension == '.bin':
                 PK3_MAGIC = 0x004E000
+                if len(header) < 0x18:
+                    return node.extension
                 check_1, check_2 = unpack_from('<II', header, 0x10)
                 if not check_1 or not check_2:
                     node.extension = '.bin'
@@ -2549,16 +2753,15 @@ class RadiataStoriesSource(BaseSource):
         # conflicts() uses the default header-link detection
         def members(self, node: VfsNode, intent: BaseSource.Packages.Intent, links: BaseSource.Packages.LinkLookup) -> tuple[BaseSource.Packages.Member, ...]:
             '''A "Kods" container needs its datacenter header (and, when importing, the entity pack sub headers).'''
-            hid    = node.hierarchical_id
-            header = links.link_of(hid)
-            if header is None:
+            linked = links.links_of(node.address)
+            if not linked:
                 return ()
-            members = [self.Member(HEADER_ROLE, header)]
+            members = [self.Member(HEADER_ROLE, linked[0])]  # This source only hase 1 link per package
             if intent is self.Intent.IMPORT:
                 for slot in range(_MAX_PACK_SLOTS):
-                    sub_header = links.link_of(hid + (slot,))
-                    if sub_header is not None:
-                        members.append(self.Member(slot_header_role(slot), sub_header, required=True))
+                    sub_linked = links.links_of((node.mid, node.hierarchical_id + (slot,)))
+                    if sub_linked:
+                        members.append(self.Member(slot_header_role(slot), sub_linked[0], required=True))
             return tuple(members)
 
     class Metadata(BaseSource.Metadata):
@@ -2566,235 +2769,7 @@ class RadiataStoriesSource(BaseSource):
         static_sources = _STATIC_METADATA_SOURCES
         def entries(self):
             yield from super().entries()
-            for hid_str, header_hid in DatacenterTargets.to_hid_str_map():
-                yield hid_str, {'target': header_hid, 'extension': '.kods'}
+            yield from _datacenter_entries()
 
     class Patches(BaseSource.Patches):
         all_patches = (TocOffsetPatch(), CutsceneSkipperPatch(), SlimmedPatch())
-
-    class Builder(BaseSource.Builder):
-        '''Disk layout for Radiata Stories, in disk order:
-        system areas + root directory, runtime ISO files, TOC padding, TOC, VFS payload.
-        tree reminder: self.source_root is the PHYSICAL tree (executable, SYSTEM, ... plus the boundary node),
-        self.vfs_root is the boundary node whose children are the TOC derived virtual files.'''
-
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.pvd: RootDirectoryStructure | None = None
-            self.toc: list[TocEntry] = []
-            self.toc_lba: int = -1
-            self.cnf: tuple[int, int] | None = None
-            self.system_areas: VfsNode = VfsNode()
-
-        @property
-        def gap_nodes(self) -> list[VfsNode]:
-            '''Unreferenced areas between the root directory and the files that folow it, sequentially'''
-            return list(self.system_areas.children[2:])
-
-        ###------------------------------- Tree ------------------------------------###
-
-        def build_tree(self) -> VfsNode:
-            self.system_areas = VfsNode()
-            self.cnf = None
-            self.source_root = self._read_root_directory()
-            self.vfs_root = self.resolve_boundary(self.source_root)
-            self.toc_lba = self.source.locate_toc(self.source_root, self.handle)
-            self.toc = self.source.decode_toc(self.handle, self.toc_lba)
-            self._read_toc_nodes()
-            return self.source_root
-
-        def _read_root_directory(self) -> VfsNode:
-            '''Returns the root node of the ISO directory tree containing all files.'''
-            if not self.source.matches(self.handle):
-                raise ValueError(
-                    f'Source does not match the signature expected for source {self.source.__class__.__name__!r}'
-                )
-            root = VfsNode(name='root')
-            # Read descriptor volume for root dir location
-            offset  = (self.geometry.iso_9660_pvd * self.geometry.sector_size) + self.geometry.pvd_byte_offset
-            pvd_len = self.handle.pread(offset, 1)[0]
-            self.system_areas.append_child(VfsNode(name='System Area 1', offset=0, size=offset))
-            self.pvd = RootDirectoryStructure.from_bytes(self.handle.pread(offset, pvd_len), self.geometry.sector_size)
-            self.system_areas.append_child(VfsNode(name='System Area 2', offset=offset + pvd_len, size=self.pvd.lba))
-            # Read root dir for files
-            bytes_read = 0
-            root_dir_view = memoryview(self.handle.pread(self.pvd.lba, self.pvd.file_size))
-            logger.debug(f'PVD file size: {self.pvd.file_size}')
-            while bytes_read < self.pvd.file_size:
-                entry_length = root_dir_view[bytes_read]
-                bytes_read  += 1
-                if not entry_length:
-                    break
-                record_slice = root_dir_view[bytes_read - 1 : bytes_read - 1 + entry_length]
-                bytes_read += entry_length - 1
-                record = RootDirectoryStructure.from_bytes(record_slice.tobytes(), self.geometry.sector_size)
-                if record.file_name in ('.', '..'): # Skip self-references
-                    continue
-                name, sep, ext = record.file_name.rpartition('.')
-                node = VfsNode(
-                    name=name,
-                    category=('ISO',),
-                    extension=sep + ext,
-                    offset=record.lba,
-                    size=record.file_size,
-                    parent=root,
-                    target=None,
-                )
-                node.is_physical = True
-                root.append_child(node)
-                if ext == 'CNF':
-                    self.cnf = (record.lba * self.geometry.sector_size, record.file_size)
-
-            # ISO Integrity Check
-            self.source.validate_filesystem(root.children)
-
-            # Root directory to end of ISO filesystem system areas - for rebuilding
-            pos = self.pvd.lba + self.pvd.file_size
-            for node in sorted(root.children, key=lambda node: node.offset):
-                gap = node.offset - pos
-                if gap > 0:
-                    self.system_areas.append_child(VfsNode(name=f'AreaBefore{node.name}', size=gap, offset=pos))
-                pos = max(pos, node.offset + node.size)
-            return root
-
-        def _read_toc_nodes(self) -> None:
-            '''Returns the root node of the VFS (the toc/gameassets)'''
-            logger.debug('Building VFS tree from TOC')
-            root = self.vfs_root
-
-            for entry in self.toc:
-                disk_index = entry.id
-                # Sentinel nodes
-                if entry.size == 0:
-                    sentinel = VfsNode(
-                        name=f'sentinel {disk_index}',
-                        offset=-1,
-                        size=-1,
-                        parent=root,
-                    )
-                    sentinel.is_hidden = True
-                    sentinel.logical_id = entry.logical_id
-                    root.append_child(sentinel)
-                    continue
-                # Valid nodes
-                node = VfsNode(
-                    name='Unknown',
-                    category=('',),
-                    offset=entry.offset,
-                    size=(entry.size * self.geometry.sector_size),
-                    parent=root,
-                    target=None,
-                )
-                node.is_physical = True
-                node.logical_id = entry.logical_id
-                root.append_child(node)
-                if disk_index in self.source.hidden_toc_indices:  # Hide file system nodes
-                    node.is_hidden = True
-            logger.info(f'Tree built - {len(root.children)} total files - {sum(1 for valid in root.children if valid.is_hidden is True)} hidden files')
-
-        def build_layout(self) -> None:
-            self._emit_prologue()
-            self._emit_runtime_files()
-            self._emit_toc_placement()
-            self._emit_toc_table()
-            self._emit_vfs_payload()
-
-        def _emit_prologue(self) -> None:
-            '''System area, PVD record, area up to the root directory, then the root directory itself.'''
-            R, geo = self.Regions, self.geometry
-            if self.pvd is None:
-                raise ValueError('PVD not found, build_tree must run before build_layout.')
-            sys_area_1_len = (geo.iso_9660_pvd * geo.sector_size) + geo.pvd_byte_offset
-            self.add_region(R.RawCopy(0, sys_area_1_len, 'System Area', self.handle))
-            self.add_region(R.RawCopy(sys_area_1_len, self.pvd.entry_length, 'PVD Record', self.handle))
-            pvd_end = sys_area_1_len + self.pvd.entry_length
-            self.add_region(R.RawCopy(pvd_end, self.pvd.lba - pvd_end, 'System Area 2', self.handle))
-            self.add_region(R.RootDirectory(
-                fixed_size=self.pvd.file_size,
-                sector_size=geo.sector_size,
-                original_bytes=self.handle.pread(self.pvd.lba, self.pvd.file_size),
-                keep_unmatched=False,
-            ), name='root_dir')
-
-        def _emit_runtime_files(self) -> None:
-            '''Runtime ISO files (IOPRP300, SYSTEM, executable) and the gaps between them, in disk order,
-            each registered in the root directory. The executable must receive the TOC offset patch.'''
-            R = self.Regions
-            root_dir = self.named.get('root_dir')
-            if not isinstance(root_dir, R.RootDirectory):
-                raise ValueError('root directory region missing, _emit_prologue must run first')
-            nodes = [child for child in self.source_root.children if child.is_physical or not child.is_boundary]
-            nodes += self.gap_nodes
-            nodes.sort(key=lambda node: node.offset)
-            suffixes = tuple(self.source.runtime_file_names)
-            patched = False
-            exec_names: list[str] = []
-            for node in nodes:
-                if not node.name.endswith(suffixes):
-                    continue
-                if node.name.startswith('AreaBefore'):
-                    self.add_region(R.RawCopy(node.offset, node.size, node.name, self.handle))
-                    continue
-                region: BaseSource.Builder.Regions.Region
-                is_exec = node.name.startswith(('SLUS', 'SLPM'))
-                patcher = self.patcher_for(node)
-                if patcher:
-                    region = R.BinaryPatch(node, self.handle, self.geometry.sector_size, patcher=patcher)
-                    patched = True
-                elif node in self.staged and node.pending_data is not None:
-                    region = R.StagedData(node, self.geometry.sector_size)
-                else:
-                    region = R.RawCopy(node.offset, node.size, node.name, self.handle)
-                if is_exec:
-                    exec_names.append(f'{node.name} (patch sites={self.patch_plan.describe(node)!r})')
-                self.add_region(region)
-                root_dir.front_section_entries.append((node, region))
-            if not patched:
-                raise ValueError(
-                    'The executable received no TOC offset patch. '
-                    f'Executable nodes seen: {exec_names or "none"}; '
-                    f'active physical patches: {[type(p).__name__ for p in self.patch_plan.active]}; '
-                    f'slimmed={self.has_flag("SLIMMED")}'
-                )
-
-        def _emit_toc_placement(self) -> None:
-            '''Padding between the ISO filesystem and the TOC. Normally pads to the TOC LBA the executable
-            expects. With SLIMMED it only sector-aligns so the TOC follows immediately, and the executable
-            patch carries the new LBA.'''
-            R, sector = self.Regions, self.geometry.sector_size
-            if self.has_flag('SLIMMED'):
-                self.add_region(R.Align(sector, 'TOC_alignment_padding'), name='toc_padding')
-            else:
-                self.add_region(R.PadToLba(_FIXED_TOC_LBA, sector, 'TOC_offset_Padding'), name='toc_padding')
-
-        def _emit_toc_table(self) -> None:
-            '''The scrambled TOC. Entries are filled by _emit_vfs_payload, so this must come before it.'''
-            self.add_region(self.Regions.Toc(
-                total_entries=self.source.toc_total_entries,  # changing this means the executable must be patched too
-                sector_size=self.geometry.sector_size,
-                scramble_fn=self.source.scramble_toc,
-            ), name=_TOC_REGION)
-
-        def _emit_vfs_payload(self) -> None:
-            '''VFS data, one sector aligned region per node, recorded in the TOC. TOC slot 0 describes the
-            TOC itself (no region); sentinels are zero size entries.'''
-            R = self.Regions
-            toc_region = self.named.get(_TOC_REGION)
-            if not isinstance(toc_region, R.Toc):
-                raise ValueError('TOC region missing, _emit_toc_table must run first')
-            sector = self.geometry.sector_size
-            for idx, child in enumerate(self.vfs_root.children):
-                if idx == 0:  # self-reference
-                    toc_region.entries.append((child, None))
-                    continue
-                orig_lba = self.toc[idx].lba if idx < len(self.toc) else 0
-                if (child.size == -1 and child not in self.staged) or orig_lba in _SENTINEL_LBAS:
-                    toc_region.entries.append((child, R.Sentinel(child)))
-                    continue
-                region: BaseSource.Builder.Regions.Region
-                if child in self.staged and child.pending_data is not None:
-                    region = R.StagedData(child, sector)
-                else:
-                    region = R.RawCopy(child.offset, child.size, child.name, self.handle)
-                toc_region.entries.append((child, region))
-                self.add_region(region, alignment=sector)

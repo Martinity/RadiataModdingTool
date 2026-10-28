@@ -14,7 +14,7 @@ from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtWidgets import QWidget, QFileDialog
 
 from core.registry import Registry
-from core.node import VfsManager, ModTracker, VfsNode, NodeConflictError
+from core.node import VfsManager, ModTracker, VfsNode, NodeConflictError, Tree, Address
 from core.workers import (
     TaskCoordinator, ActionStatus, ActionResult, Actions, ActionType, TaskHandle, LogChannel,
     ActionDef, EditorPayload
@@ -77,7 +77,7 @@ class Dispatcher(QObject):
     # Generic node actions
     action_complete  = pyqtSignal(ActionResult)      # ActionResult
     # Metadata inconsistencies
-    ghost_node_confirmed_missing = pyqtSignal(tuple) # hids
+    ghost_node_confirmed_missing = pyqtSignal(tuple) # Address (mid, hid)
 
     def __init__(self) -> None:
         super().__init__()
@@ -373,7 +373,7 @@ class Dispatcher(QObject):
 
     def _execute_package_import(self, node: VfsNode, action_def: ActionDef, **kwargs) -> None:
         '''Package import helper: resolves unresolved nodes needed for import and start the worker.'''
-        if self.vfs is None or not node.target or not self.nav:
+        if self.vfs is None or not node.links or not self.nav:
             return
         self.vfs.remove_node_children(node)
         handler_class = Registry.get_handler(node)
@@ -421,16 +421,16 @@ class Dispatcher(QObject):
 
     def request_editor_payload(
         self,
-        hid: tuple[int, ...],
+        address: Address,
         callback: Callable[[Any], None]
     ) -> None:
-        '''Called by an active editor to request an editor payload for a given node hid.'''
+        '''Called by an active editor to request an editor payload for a given node address.'''
         if not self.nav:
             callback(None)
             return
         task_handle = self._start(
             Actions.fetch_for_editor,
-            hid,
+            address,
             self.nav,
         )
         def _on_finished(success: bool, payload: Any) -> None:
@@ -440,37 +440,37 @@ class Dispatcher(QObject):
 
     def request_raw_data(
         self,
-        hid: tuple[int, ...],
+        address: Address,
         callback: Callable[[Any], None]
     ) -> None:
-        '''Called by an active editor to request raw data for a given node hid.'''
+        '''Called by an active editor to request raw data for a given node address.'''
         if not self.nav or not self.vfs:
             callback(None)
             return
-        data = self.nav.resolve_data_from_hid(hid) # Ensure data is resolved before looking up the node
-        node = self.vfs.get_vfs_node_by_id(hid)
+        data = self.nav.resolve_data_from_address(address) # Ensure data is resolved before looking up the node
+        node = self.vfs.get_node(address)
         if node is not None and data is not None:
             payload = EditorPayload(node=node, data=data)
             callback(payload)
         else:
-            logger.error(f'Failed to resolve data or node for hid: {hid}')
+            logger.error(f'Failed to resolve data or node for address: {address}')
             callback(None)
 
     ###------------------------------- VFS node resolution passthroughs -------------------------------###
 
-    def resolve_and_unpack_all(self, target_hid: tuple[int, ...], on_success: Callable[[list[VfsNode]], None]) -> None:
+    def resolve_and_unpack_all(self, target: Address, on_success: Callable[[list[VfsNode]], None]) -> None:
         '''Asynchronous entrypoint for unpack recursively untill no more ActionType.TREE_EXPAND actionable nodes remain.'''
         if not self.nav:
             logger.error('Navigator not initialised')
             return
-        self.nav.unpack_recursive(target_hid, on_success)
+        self.nav.unpack_recursive(target, on_success)
 
-    def resolve_ghost_node(self, target_hid: tuple[int, ...], on_success: Callable[[VfsNode], None]) -> None:
-        '''Asynchronous entrypoint for unpacking the VFS until the target hid is reached'''
+    def resolve_ghost_node(self, target: Address, on_success: Callable[[VfsNode], None]) -> None:
+        '''Asynchronous entrypoint for unpacking the VFS until the target address is reached'''
         if not self.nav:
             logger.error('Navigator not initialised')
             return
-        self.nav.resolve_ghost_node(target_hid, on_success)
+        self.nav.resolve_ghost_node(target, on_success)
 
     def close(self) -> None:
         '''
@@ -488,6 +488,12 @@ class Dispatcher(QObject):
             return
         if self.active_handler:
             self.active_handler.close()
+        if self.vfs is not None:  # Remove connections to dead VfsManagers
+            for signal in (self.tracker.node_modified, self.tracker.node_reverted):
+                try:
+                    signal.disconnect(self.vfs.update_node)
+                except TypeError:
+                    pass
         self.vfs            = None
         self.active_handler = None
         self.nav            = None
@@ -512,6 +518,21 @@ class Dispatcher(QObject):
         )
         task_handle.finished.connect(self._on_source_loaded)
         return task_handle
+
+    def _build_tree(self, root: VfsNode) -> Tree:
+        '''Get the Tree the active source defines. BaseSource.open_tree() is the entrypoint
+        (ex. read_iso -> decode_toc -> build_tree -> validation)'''
+        handler = self.active_handler
+        if handler is None:
+            return Tree(root)
+        opened = getattr(handler, 'opened', None)
+        if opened is None:
+            opened = handler.source.open_tree(handler.handle)
+            try:
+                handler.opened = opened
+            except AttributeError:
+                pass
+        return opened.tree
 
     ###------------------------ Callbacks and Signals -----------------------###
     def _on_expand_requested(self, parent: VfsNode, wait_event: threading.Event) -> None:
@@ -561,20 +582,19 @@ class Dispatcher(QObject):
             # Runs after on_action_complete so waiters see node.children
             self.nav.complete_expansion(node, success)
 
-    def _on_ghost_node_confirmed_missing(self, hid: tuple[int, ...]) -> None:
+    def _on_ghost_node_confirmed_missing(self, address: Address) -> None:
         '''VfsNavigator callback for invalid metadata entries. Triggering deletion.'''
-        self.ghost_node_confirmed_missing.emit(hid)
+        self.ghost_node_confirmed_missing.emit(address)
 
-    def _handle_ghost_node_confirmed_missing(self, hid: tuple[int, ...]) -> None:
+    def _handle_ghost_node_confirmed_missing(self, address: Address) -> None:
         '''
         QueuedConnection slot for ghost_node_confirmed_missing. Runs on the main thread.
         Purges a metadata entry that Navigator has conclusively proven does not exist.
         '''
         if self._metadata_store is None:
             return
-        hid_str = '.'.join(map(str, hid))
-        logger.warning(f'Purging stale metadata entry for confirmed-missing node: {hid_str}')
-        self._metadata_store.delete(hid_str)
+        logger.warning(f'Purging stale metadata entry for confirmed-missing node: {address}')
+        self._metadata_store.delete(address)
 
     def _handle_extension_request(self, node: VfsNode, auto_save: bool = True) -> None:
         '''
@@ -598,8 +618,8 @@ class Dispatcher(QObject):
         else:
             node.extension = self.active_handler.source.extensions.resolve(node, header)
         if auto_save and self._metadata_store is not None:
-            self._metadata_store.register(node.hierarchical_id_str, extension=node.extension)
-            logger.debug(f'Extension request saved: {node.hierarchical_id_str} -> {node.extension}')
+            self._metadata_store.register(node.address, extension=node.extension)
+            logger.debug(f'Extension request saved: {node.address} -> {node.extension}')
 
     def _on_source_loaded(self, success: bool, result: object) -> None:
         '''Takes the ISO's root+children nodes and intializes:
@@ -619,15 +639,23 @@ class Dispatcher(QObject):
             self.source_loaded.emit(False, msg)
             return
 
-        self.vfs = VfsManager(
-            root,
-            self.active_handler.source.resolve_boundary(root),
-            node_enricher=(self._metadata_store.enrich if self._metadata_store else None)
-        )
+        try:
+            tree = self._build_tree(root)
+            self.vfs = VfsManager(
+                self._build_tree(root),
+                node_enricher=(self._metadata_store.enrich if self._metadata_store else None)
+            )
+        except Exception as e:
+            logger.error(f'Failed to open source: {e}', exc_info=True)
+            self.vfs = None
+            self.source_loaded.emit(False, str(e))
+            return
+        root = tree.root
         # Connect signals
         self.tracker.node_modified.connect(self.vfs.update_node)
         self.tracker.node_reverted.connect(self.vfs.update_node)
         self.vfs.request_extension.connect(self._handle_extension_request)
+        self.vfs.enrich_initial_tree()
 
         self.nav = VfsNavigator(
             self.vfs,
@@ -759,7 +787,7 @@ class RebuildCoordinator(QObject):
         (e.g. the Patches menu). Resolves every active patch's targets
         (asynchronously expanding ghost nodes as needed) before opening the
         save dialog, since handler.rebuild_node needs concrete VfsNodes, not
-        HIDs that might not be reachable yet.
+        addresses that might not be reachable yet.
         '''
         self.preparing_build.emit()
         self._dispatcher.set_active_channel(LogChannel.REBUILD)
@@ -800,7 +828,7 @@ class RebuildCoordinator(QObject):
             patch_targets.setdefault(patch.action, []).extend(leaves)
             self.log.emit(f'Successfully resolved {len(leaves)} nodes for patch {patch.name}, action: {patch.action}')
             self._resolve_patch_targets(staged_nodes, build_flags, rest, patch_targets)
-        self._dispatcher.resolve_and_unpack_all(patch.hid, _on_resolved)
+        self._dispatcher.resolve_and_unpack_all(patch.address, _on_resolved)
 
     def _begin(
         self,

@@ -342,17 +342,16 @@ class MainWindow(QMainWindow):
         self.status_bar.clearMessage()
 
     def _reload_metadata_for_source(self) -> None:
-        handler = getattr(self.dispatcher, 'active_handler', None)
-        source = getattr(handler, 'source', None)
-        metadata_path = getattr(source, 'metadata_path', None)
-        if source is None or metadata_path is None:
+        handler  = getattr(self.dispatcher, 'active_handler', None)
+        source   = getattr(handler, 'source', None)
+        metadata = getattr(source, 'metadata_path', None)
+        if metadata is None or not metadata.path:
             return
-        resolved = get_resource_path(metadata_path)
-        if not resolved.is_file():
-            logger.info(f'{metadata_path} not found. Building metadata from scratch if possible...')
-            source.build_metadata(self.metadata_store)
-            return
+        resolved = get_resource_path(metadata.path)
         self.metadata_store.reload(resolved)
+        if not resolved.is_file():
+            logger.info(f'{metadata.path} not found. Building metadata from scratch if possible...')
+            metadata.build(self.metadata_store)
 
     def on_rebuild_complete(self, success: bool, message: str) -> None:
         """Handles the completion signal from the background thread"""

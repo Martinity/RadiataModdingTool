@@ -13,7 +13,7 @@ from typing import Any
 
 from core.contracts import BaseEditor
 from core.dispatcher import Dispatcher
-from core.metadata_manager import NodeMetadataStore
+from core.metadata_manager import NodeMetadataStore, address_to_key
 from core.node import VfsNode
 from core.registry import GLOBAL_ACTIONS, Registry
 from core.workers import ActionDef, ActionResult, ActionStatus, ActionType, EditorPayload
@@ -263,7 +263,7 @@ class FileBrowserBehavior(QObject):
         hids_str = node.hierarchical_id_str
         node.name = title
         node.category = tags
-        self.metadata_store.register(hid=hids_str, title=title, description=description, tags=list(tags))
+        self.metadata_store.register(node.address, title=title, description=description, tags=list(tags))
         self.view.metadata_panel.load_node(node, title, description, tags)
 
     ###----------------- Tree interactions-------------------###
@@ -280,7 +280,7 @@ class FileBrowserBehavior(QObject):
         self._last_selected_node = node
 
         # Load metadata falling back to node properties if none exists
-        meta  = self.metadata_store.get(node.hierarchical_id_str)
+        meta  = self.metadata_store.get(node.address)
         title = meta.title if meta and meta.title else node.name
         desc  = meta.description if meta else ''
         tags  = meta.tags if meta and meta.tags else node.category
@@ -327,7 +327,7 @@ class FileBrowserBehavior(QObject):
             self._handle_goto(entry.node)
         else:  # Ghost node
             hid = tuple(map(int, entry.hid_str.split('.')))
-            self.dispatcher.resolve_ghost_node(hid, self._handle_goto)
+            self.dispatcher.resolve_ghost_node(entry.address, self._handle_goto)
 
     def _on_search_double_click(self, index: QModelIndex) -> None:
         """
@@ -340,12 +340,9 @@ class FileBrowserBehavior(QObject):
         entry = self.search_model.data(index, Qt.ItemDataRole.UserRole)
         node  = entry.node
         if node is None:
-            hid = tuple(map(int, entry.hid_str.split('.')))
-            ancestor = self.dispatcher.vfs.find_nearest_ancestor(hid)
-            if ancestor is not None:
-                node = self.dispatcher.vfs.get_vfs_node_by_id(hid)
+            node = self.dispatcher.vfs.get_node(entry.address)
         if node is None:
-            logger.warning(f'No node found for id:({entry.hid_str})')
+            logger.warning(f'No node found for address: {entry.address}')
             return
         editor_classes = Registry.get_editors(node)
         if editor_classes:
@@ -383,12 +380,12 @@ class FileBrowserBehavior(QObject):
             return
         entry = self.search_model.data(index, Qt.ItemDataRole.UserRole)
         node  = entry.node
-        hid   = tuple(map(int, entry.hid_str.split('.')))
+        address = node.address
         if not node and self.dispatcher.vfs:
-            self.dispatcher.resolve_ghost_node(hid, self._handle_goto)
-            node = self.dispatcher.vfs.get_vfs_node_by_id(hid)
+            self.dispatcher.resolve_ghost_node(address, self._handle_goto)
+            node = self.dispatcher.vfs.get_node(address)
         if not node:
-            logger.error(f'No node found for ({hid})')
+            logger.error(f'No node found for {address}')
             return
         self._build_context_menu(node, self.view.search_results_view.mapToGlobal(position))
 
@@ -841,10 +838,9 @@ class FileMetadataPanel(QWidget):
     def load_node(self, node: VfsNode, title: str, description: str, tags: tuple[str, ...]) -> None:
         """Populate the panel data from the given VfsNode and its metadata."""
         self._current_node = node
-        hid = node.hierarchical_id_str
 
         self._name_label.setText(title or node.name)
-        self._hid_label.setText(hid)
+        self._hid_label.setText(address_to_key(node.address))
         self._edit_btn.setEnabled(True)
 
         self._clear_layout(self._tags_row)
@@ -864,7 +860,7 @@ class FileMetadataPanel(QWidget):
             ('Size', human_size(node.size)),
             ('Offset', hex(node.offset) if node.offset else '-'),
             ('Physical', 'Yes' if node.is_physical else 'No'),
-            ('Dependant HID', str(node.target) if node.target else '-'),
+            ('Links', ', '.join(address_to_key(link) for link in node.links) or '-'),
         ]:
             self._info_layout.addWidget(self._info_row(label, value))
 

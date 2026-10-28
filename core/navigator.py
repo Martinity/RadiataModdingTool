@@ -12,8 +12,8 @@ Traversal API (Physical to Virtual):
 Expansion API (Concurrency-Safe Discovery):
     request_expansion       - Core orchestrator for async, multi-threaded node expansion.
     complete_expansion      - Signals the conclusion of an in-flight expansion task.
-    resolve_ghost_node      - Recursively expands ancestors to discover a specific target HID.
-    resolve_data_from_hid   - Resolves a target HID directly to raw bytes, triggering expansions as needed.
+    resolve_ghost_node      - Recursively expands ancestors to discover a specific target Address (mid, hid).
+    resolve_data_from_address - Resolves a target Address directly to raw bytes, triggering expansions as needed.
     unpack_recursive        - Deeply expands a target and all of its children recursively.
 
 Package API
@@ -147,7 +147,7 @@ class VfsNavigator:
 
     def _report_confirmed_missing(self, address: Address, reason: str) -> None:
         '''The entrypoint to cleaning a false record from the metadata database'''
-        logger.warning(f'Confirmed non-existent HID {address}: {reason}')
+        logger.warning(f'Confirmed non-existent address {address}: {reason}')
         if self.ghost_node_callback:
             self.ghost_node_callback(address)
 
@@ -178,9 +178,9 @@ class VfsNavigator:
             return b''
         return self._walk_chain(chain)
 
-    def resolve_data_from_hid(self, target: Address | None) -> bytes | None:
+    def resolve_data_from_address(self, target: Address | None) -> bytes | None:
         '''
-        Resolve HID to raw bytes. snapshot -> expand missing -> re-read. In order of hids indexes.
+        Resolve an Address to raw bytes. snapshot -> expand missing -> re-read. In order of hids indexes.
         Returning pending data first if exists.
         '''
         if not target:
@@ -189,7 +189,7 @@ class VfsNavigator:
             logger.warning(f'Cannot resolve {target}: namespace {target[0]} is not accessible.')
             return None
 
-        logger.debug(f'Resolving HID: {target}.')
+        logger.debug(f'Resolving address: {target}.')
         for _ in range(self.MAX_RESOLUTION_DEPTH):
             snapshot = self.vfs.snapshot_hids([target])  # Get VFS snapshot
             if not snapshot.unresolved:  # target is already expanded
@@ -210,13 +210,13 @@ class VfsNavigator:
 
         node = self.vfs.get_node(target)
         if not node:
-            logger.warning(f'Could not resolve HID: {target}')
+            logger.warning(f'Could not resolve address: {target}')
             return None
         return self.read(node)
 
     def resolve_ghost_node(self, target_address: Address, on_success: Callable[[VfsNode], None]) -> None:
         '''
-        Resolve a target hid to a real VfsNode, meaning that a failed on_success will not expand (see _drill_down_to).
+        Resolve a target address to a real VfsNode, meaning that a failed on_success will not expand (see _drill_down_to).
         on_success is synchronous for already reachable targets, otherwise async
         '''
         if not self.vfs:
@@ -224,8 +224,8 @@ class VfsNavigator:
             return
         self._drill_down_to(target_address, on_success)
 
-    def unpack_recursive(self, target_hid: tuple[int, ...], on_success: Callable[[list[VfsNode]], None]) -> None:
-        '''Resolve target hid then expand all children recursively until no TREE_EXPAND actions remain.
+    def unpack_recursive(self, target_address: Address, on_success: Callable[[list[VfsNode]], None]) -> None:
+        '''Resolve target address then expand all children recursively until no TREE_EXPAND actions remain.
         on_success does not continue to expand on failure, see _drill_down_to'''
         self.resolve_ghost_node(target_address, lambda node: self._deep_unpack_layer([node], [], on_success))
 
@@ -269,8 +269,8 @@ class VfsNavigator:
         for spec in specs:
             if spec.required:
                 member = self.vfs.get_node(spec.address)
-                raw    = self.resolve_data_from_hid(spec.address)
-            else:  # check the bytes so the VFS is not consulted (save nonexistant metadata HIDs)
+                raw    = self.resolve_data_from_address(spec.address)
+            else:  # check the bytes so the VFS is not consulted (save nonexistant metadata addresses)
                 member = self.vfs.get_node(spec.address)
                 raw    = self.read(member) if member is not None else None
             if raw is None or member is None:
@@ -388,16 +388,16 @@ class VfsNavigator:
 
     def _expand_pending(self, unresolved: list[Address]) -> None:
         '''
-        Find nearest ancestor for each unresolved HID and block this thread
+        Find nearest ancestor for each unresolved address and block this thread
         until each expansion completes or times out. Routes through
         request_expansion(), so this is safe to call even if a UI-driven
         expansion of the same ancestor is already in flight on another thread.
         '''
         ancestors_needed: dict[Address, VfsNode] = {}
-        for hid in unresolved: # Deduplicate
-            ancestor = self.vfs.find_nearest_ancestor(hid)
+        for address in unresolved: # Deduplicate
+            ancestor = self.vfs.find_nearest_ancestor(address)
             if not ancestor:
-                logger.warning(f'No registered ancestor found for HID {hid}')
+                logger.warning(f'No registered ancestor found for address {address}')
                 continue
             ancestors_needed.setdefault(ancestor.address, ancestor)
 
@@ -410,36 +410,36 @@ class VfsNavigator:
 
     def _drill_down_to(
         self,
-        target_hid: Address,
+        target_address: Address,
         on_success: Callable[[VfsNode], None],
     ) -> None:
         '''
-        Recursively expand ancestors until target_hid becomes reachable.
+        Recursively expand ancestors until target_address becomes reachable.
         Bounded by tree depth and _evaluate_stalled which will trigger metadata cleaning
         on confirmed false entries.
         '''
-        node = self.vfs.get_node(target_hid)
+        node = self.vfs.get_node(target_address)
         if node:
             on_success(node)
             return
 
-        ancestor = self.vfs.find_nearest_ancestor(target_hid)
+        ancestor = self.vfs.find_nearest_ancestor(target_address)
         if not ancestor:
-            logger.error(f'Cannot resolve {target_hid}: No ancestor exists.')
+            logger.error(f'Cannot resolve {target_address}: No ancestor exists.')
             return
 
-        if self._evaluate_stalled(ancestor, target_hid):
+        if self._evaluate_stalled(ancestor, target_address):
             return
         if not self._needs_expansion(ancestor):
-            logger.error(f'Cannot resolve {target_hid} from ancestor {ancestor.address}')
+            logger.error(f'Cannot resolve {target_address} from ancestor {ancestor.address}')
             return
 
-        logger.debug(f'Drilling down to {target_hid} from ancestor {ancestor.address}')
+        logger.debug(f'Drilling down to {target_address} from ancestor {ancestor.address}')
         def _continue(success: bool, expanded_node: VfsNode) -> None:
             if not success:
-                logger.error(f'Failed to drill down to {target_hid}. Failed at {expanded_node.name} {expanded_node.address}.')
+                logger.error(f'Failed to drill down to {target_address}. Failed at {expanded_node.name} {expanded_node.address}.')
                 return
-            self._drill_down_to(target_hid, on_success)
+            self._drill_down_to(target_address, on_success)
 
         self.request_expansion(ancestor, _continue)
 

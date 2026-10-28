@@ -6,7 +6,9 @@ Contract map:
     Handlers    BaseHandler > PhysicalHandler / ContainerHandler / LeafHandler
     Editors     BaseEditor  > BaseViewer
     Sources     BaseSource
-                  .Namespaces         source.namespaces.physical / .default / .metadata_of(mid) / .mount_point(node)
+                  TOC                 locate_toc / decode_toc / encode_toc                  # if needed, default: pass
+                  tree                build_tree(tree, toc, handle) -> source.open_tree()   # the hierarchical trees
+                  layout              build_layout(rebuild)         -> sourcce.rebuild()    # the physical bytes regions
                   .Extensions         source.extensions.resolve(node, header)
                   .Packages           source.packages.members(...) / .conflicts(...)
                   .Metadata           source.metadata.path / .entries() / .audit() / .build(store)
@@ -22,18 +24,18 @@ import array
 import inspect
 import struct
 import sys
-import re
 from functools import cached_property
 from dataclasses import dataclass, field
 from enum import Flag, Enum, auto
 from pathlib import Path
+from core.metadata_manager import address_to_key, is_address, parse_hid
 from typing import (
     Any, AbstractSet, Callable, cast, Iterator, NamedTuple, TYPE_CHECKING, TypeAlias, runtime_checkable, BinaryIO, Protocol,
     ClassVar, Sequence, Mapping
 )
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import pyqtSignal
-from core.node import VfsNode, Address, Mid, PHYSICAL, DEFAULT
+from core.node import VfsNode, Address, Mid, Namespace, Tree
 if TYPE_CHECKING:
     from core.workers import TaskHandle, EditorPayload
     from core.native.block_device import BlockDevice
@@ -792,14 +794,93 @@ class DiskLayoutPlanner:
                 task_handle.progress.emit(pct)
         return bytes_written
 
+###------------------------------------- Rebuild -------------------------------------###
+
+class Rebuild:
+    '''One rebuild of a source'''
+    def __init__(
+        self,
+        source:    BaseSource,
+        *,
+        handle:    BlockDevice,
+        tree:      Tree,
+        staged:    frozenset[VfsNode],
+        flags:     SourceRebuildFlags,
+        toc:       list[TocEntry],
+        pvd:       RootDirectoryStructure,
+        gap_nodes: list[VfsNode],
+        log:       Callable[[str], None] | None = None,
+    ) -> None:
+        self.source    = source
+        self.geometry  = source.geometry
+        self.handle    = handle
+        self.tree      = tree
+        self.staged    = staged
+        self.flags     = flags
+        self.toc       = toc
+        self.pvd       = pvd
+        self.gap_nodes = gap_nodes
+        self.log       = log or (lambda message: None)
+
+        self.planner: DiskLayoutPlanner = DiskLayoutPlanner()
+        self.named:   dict[str, DiskRegion] = {}
+        self.rebuild_context = RebuildContext(regions=self.named, sector_size=self.geometry.sector_size)
+
+        self.patch_plan = source.patches.plan(handle, flags)
+
+    @property
+    def roots(self) -> Mapping[Mid, VfsNode]:
+        return self.tree.hosts
+
+    @property
+    def source_root(self) -> VfsNode:
+        return self.tree.root
+
+    @property
+    def vfs_root(self) -> VfsNode:
+        assert self.tree.default is not None
+        return self.tree.hosts[self.tree.default]
+
+    def add_region(self, region: DiskRegion, name: str | None = None, alignment: int | None = None) -> DiskRegion:
+        '''Append a region, keyed by name.'''
+        if name is not None:
+            if name in self.named:
+                raise ValueError(f'Layout already defines a region for {name}')
+            self.named[name] = region
+        return self.planner.add(region, alignment=alignment)
+
+    def lba_of(self, name: str) -> int:
+        return self.rebuild_context.lba_of(name)
+
+    def patcher_for(self, node: VfsNode) -> Callable[[bytearray], None] | None:
+        '''Byte patcher for the node.'''
+        if not self.patch_plan.covers(node):
+            return None
+        return self.patch_plan.patcher(node, self.rebuild_context)
+
+    def has_flag(self, flag: SourceRebuildFlags | str) -> bool:
+        '''True if rebuild was requested with the flag'''
+        if isinstance(flag, str):
+            member = get_member(self.flags, flag)
+            return member is not None and bool(self.flags & member)
+        return bool(self.flags & flag)
+
 ###------------------------------------- Source -------------------------------------###
+
+@dataclass(frozen=True)
+class OpenedSource:
+    '''Everything needed to be held for an active source'''
+    tree:      Tree
+    toc:       list[TocEntry]
+    pvd:       RootDirectoryStructure
+    gap_nodes: list[VfsNode]
 
 class BaseSource(abc.ABC):
     '''
     A source profile for one game/disc layout. Subclass it and fill in the pieces you need.
 
     Plain attributes:  display_name, toc_total_entries, rebuild_flags, geometry, hidden_toc_indices,
-                       build_hashes, metadata_path
+                       build_hashes
     Domain data:       signature (+ signature_offset), required_files, executable_candidates, toc_seed
                        drive the default matches / validate_filesystem / decode_toc / encode_toc / scramble_toc
                        (runtime_file_names defaults to required_files | executable_candidates)
@@ -808,24 +889,21 @@ class BaseSource(abc.ABC):
 
     Components (nested classes, one instance per source via source.<lowercase name>):
 
-        class Namespaces    source.namespaces.physical / .default / .metadata_of(mid) / .mount_point(node)
         class Extensions    source.extensions.resolve(node, header)
         class Packages      source.packages.members(...) / .conflicts(...)
-        class Metadata      source.metadata.build(store)
+        class Metadata      source.metadata.path / .build(store)        - one json per source, keyed by Address
         class Patches       source.patches.all_patches / .options / .active(flags) / .plan(handle, flags)
                               BasePatch > BasePhysicalPatch / BaseVirtualPatch live here
         class Builder       source.create_builder(...) -> .build(dst, task_handle)   (optional)
                               region types live in Builder.Regions
     '''
     display_name:       ClassVar[str]
-    toc_total_entries:  ClassVar[int]
+    toc_total_entries:  ClassVar[int] = 0  # Default to 0 for sources that have no external/secondary TOC
     rebuild_flags:      ClassVar[type[SourceRebuildFlags]]
     geometry:           ClassVar[SourceGeometry] = SourceGeometry()
     hidden_toc_indices: ClassVar[frozenset[int]] = frozenset()
     runtime_file_names: ClassVar[frozenset[str]] = frozenset()
     build_hashes:       ClassVar[dict[str, str]] = {}
-    metadata_path:      ClassVar[str] = ''
-    builder:            ClassVar[type[BaseSource.Builder]]
 
     signature:             ClassVar[bytes] = b''
     signature_offset:      ClassVar[int] = 0x28
@@ -834,17 +912,31 @@ class BaseSource(abc.ABC):
     toc_seed:              ClassVar[int | None] = None      # XOR scramble seed; None = plain TOC
 
     # Names for the types a source needs, so a source module only imports BaseSource
-    Flags:    TypeAlias = SourceRebuildFlags
-    Geometry: TypeAlias = SourceGeometry
-    TocEntry: TypeAlias = TocEntry
+    Flags:     TypeAlias = SourceRebuildFlags
+    Geometry:  TypeAlias = SourceGeometry
+    TocEntry:  TypeAlias = TocEntry
+    Rebuild:   TypeAlias = Rebuild
+    Tree:      TypeAlias = Tree
+    Namespace: TypeAlias = Namespace
 
-    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Namespaces', 'Metadata', 'Patches', 'Builder')
+    class Regions:
+        '''Region types a layout is built from. Aliased so builders don't need to import a bunch of classes.'''
+        Region        = DiskRegion
+        RawCopy       = RawCopyRegion
+        StagedData    = StagedDataRegion
+        ZeroFill      = ZeroFillRegion
+        Align         = AlignRegion
+        PadToLba      = PadToLbaRegion
+        Sentinel      = SentinelRegion
+        Toc           = TocRegion
+        RootDirectory = RootDirectoryRegion
+        BinaryPatch   = BinaryPatchRegion
+
+    COMPONENTS: ClassVar[tuple[str, ...]] = ('Extensions', 'Packages', 'Metadata', 'Patches')
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         '''Validate and derive the components a source declares'''
         super().__init_subclass__(**kwargs)
-        if 'metadata_path' in cls.__dict__:
-            raise TypeError(f'{cls.__name__}: move `metadata_path` into the component: `class Metadata:  path = ...`')
         for attr in ('required_files', 'executable_candidates', 'runtime_file_names'):
             if attr in cls.__dict__:
                 setattr(cls, attr, frozenset(cls.__dict__[attr]))
@@ -854,8 +946,6 @@ class BaseSource(abc.ABC):
             declared = cls.__dict__.get(name)
             if declared is not None and not (isinstance(declared, type) and issubclass(declared, getattr(BaseSource, name))):
                 raise TypeError(f'{cls.__name__}.{name} must subclass BaseSource.{name}: write `class {name}(BaseSource.{name}):`.')
-        cls.builder = cls.Builder
-        cls.metadata_path = cls.Metadata.path
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} source_id={getattr(self, 'source_id', '?')}>"
@@ -876,21 +966,74 @@ class BaseSource(abc.ABC):
             raise ValueError(f'Invalid filesystem: missing an executable, {sorted(self.executable_candidates)}.')
 
     ### Table of contents
-    @abc.abstractmethod
     def locate_toc(self, root: VfsNode, handle: BlockDevice) -> int:
         '''Return the LBA of the TOC'''
+        raise NotImplementedError(f'{type(self).__name__} does not define a TOC.')
 
-    @abc.abstractmethod
     def decode_toc(self, handle: BlockDevice, toc_lba: int) -> list[TocEntry]:
         '''Read and parse the TOC into TocEntry objects'''
+        raise NotImplementedError(f'{type(self).__name__} does not define a TOC.')
 
-    @abc.abstractmethod
     def encode_toc(self, entries: list[TocEntry]) -> bytes:
         '''Serialize the TOC entries into a byte string'''
+        raise NotImplementedError(f'{type(self).__name__} does not define a TOC.')
 
     def scramble_toc(self, flat_toc: list[int]) -> list[int]:
         '''Process the toc into valid data. Only necesarry if the TOC is not plain bytes'''
         return flat_toc
+
+    def read_iso(self, handle: BlockDevice) -> tuple[VfsNode, RootDirectoryStructure, list[VfsNode]]:
+        '''Physical root, root directory record, and the unowned gaps between nodes.'''
+        raise NotImplementedError(f'{type(self).__name__} must implement read_iso.')
+
+    ### Tree + Namespaces
+    @abc.abstractmethod
+    def build_tree(self, handle: BlockDevice, root: VfsNode, toc: list[TocEntry]) -> Tree:
+        '''Define the filesystem, its tree and the namespaces it must open. The physical root
+        is the default namespace that contains all other namespaces.
+
+        A filesystem with no virtual or external tree: `tree.default = PHYSICAL`
+        '''
+        raise NotImplementedError(f'{type(self).__name__} must build a Tree.')
+
+    def open_tree(self, handle: BlockDevice) -> OpenedSource:
+        '''Define the filesystem and check what was defined.'''
+        root, pvd, gaps = self.read_iso(handle)
+        toc  = self.decode_toc(handle, self.locate_toc(root, handle))
+        tree = self.build_tree(handle, root, toc)
+        self._check_tree(tree)
+        return OpenedSource(tree, toc, pvd, gaps)
+
+    def _check_tree(self, tree: Tree) -> None:
+        '''Validate what build_tree defined.'''
+        name = type(self).__name__
+        if not isinstance(tree, Tree):
+            raise TypeError(f'{name}.build_tree must return a Tree, got {type(tree).__name__}')
+        if tree.default is None:
+            raise ValueError(f'{name}.build_tree defined no default namespace')
+        if tree.default not in tree.hosts:
+            raise ValueError(f'{name}.build_tree: the default namespace {tree.default} must be one of the opened namespaces')
+        for mid, namespace in tree.namespaces.items():
+            if namespace.metadata is not None:
+                raise ValueError(f'{name} {mid}: Metadata is declared per source not namespace.')
+        self.metadata.ensure_valid(tree)
+
+    ### Rebuild
+    @property
+    def supports_rebuild(self) -> bool:
+        return type(self).build_layout is not BaseSource.build_layout
+
+    def build_layout(self, rebuild: Rebuild) -> None:
+        '''Add every region of the source front to back'''
+        raise NotImplementedError(f'{type(self).__name__} does not define build_layout.')
+
+    def rebuild(self, dst: BinaryIO, task_handle: TaskHandle, progress_every: int = 1, **inputs: Any) -> int:
+        rebuild = Rebuild(self, **inputs)
+        self.build_layout(rebuild)
+        rebuild.log(f'Resolving physical disk layout offsets for {len(rebuild.planner.regions)} regions')
+        rebuild.planner.resolve_offsets()
+        rebuild.log('Starting sequential write...')
+        return rebuild.planner.write_all(dst, task_handle, progress_every)
 
     ###-------------------- Components --------------------###
 
@@ -922,9 +1065,10 @@ class BaseSource(abc.ABC):
             required: bool = True
         @runtime_checkable
         class LinkLookup(Protocol):
-            '''Resolves links between nodes required to resolve a package
+            '''Resolves links between nodes required to resolve a package.
             Satisfied by metadata.'''
-            def link_of(self, address: Address) -> Address | None: ...
+            def links_of(self, address: Address) -> tuple[Address, ...]: ...
+
         @dataclass(frozen=True, slots=True)
         class Finding:
             '''One source-defined filesystem conflic.
@@ -935,50 +1079,20 @@ class BaseSource(abc.ABC):
         def members(self, node: VfsNode, intent: Intent, links: LinkLookup) -> tuple[Member, ...]:
             '''Return the members (nodes) that make up a package, or () if not a package.'''
             return ()
+
         def conflicts(self, incoming: VfsNode, pending: frozenset[VfsNode], links: LinkLookup) -> list[Finding]:
             '''Returns the conflicts between the incoming node and the pending nodes.
-            Default: a node and the node it links with have independent pending edits.'''
+            Default: a node and the nodes it links with have independent pending edits.'''
             address           = incoming.address
-            dependent_address = links.link_of(address)
+            dependent_address = links.links_of(address)
             findings: list[BaseSource.Packages.Finding] = []
             for other in pending:
                 other_address = other.address
-                if dependent_address is not None and other_address == dependent_address:
+                if other_address in dependent_address:
                     findings.append(self.Finding(other, f'{incoming} depends on header from {other} which has pending modifications'))
-                elif links.link_of(other_address) == address:
+                elif address in links.links_of(other_address):
                     findings.append(self.Finding(other, f'{other} depends on header from {incoming} which has pending modifications'))
             return findings
-
-    class Namespaces(Component):
-        ''''''
-        physical: ClassVar[Mid] = PHYSICAL
-        default:  ClassVar[Mid] = DEFAULT
-        metadata: ClassVar[Mapping[Mid, type[BaseSource.Metadata]]] = {}
-
-        def metadata_of(self, mid: Mid) -> BaseSource.Metadata | None:
-            '''The metadata that names the nodes of namespace mid or None if it has None'''
-            declared = self.metadata.get(mid)
-            if declared is None:
-                return self.source.metadata if mid == self.default else None
-            return declared(self.source)
-
-        def mount_point(self, node: VfsNode) -> Mid | None:
-            '''Called for each node as it appears. Return the id of the namespace it roots, else None.'''
-            return None
-
-        @classmethod
-        def validate(cls, source: type[BaseSource]) -> None:
-            name = source.__name__
-            for attr in ('physical', 'default'):
-                value = getattr(cls, attr)
-                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                    raise TypeError(f'{name}.Namespaces.{attr} must be an int >= 0, got {value!r}.')
-                for mid, metadata in cls.metadata.items():
-                    if not isinstance(mid, int) or isinstance(mid, bool) or mid < 0:
-                        raise TypeError(f'{name}.Namespaces.metadata key {mid!r} must be and int >= 0.')
-                    if not (isinstance(metadata, type) and issubclass(metadata, BaseSource.Metadata)):
-                        raise TypeError(f'{name}.Namespaces.metadata[{mid}] must be a BaseSource.Metadata subclass, got {metadata!r}.')
-                    metadata.validate(source)
 
     class Metadata(Component):
         '''
@@ -988,8 +1102,7 @@ class BaseSource(abc.ABC):
             static_sources  StaticMetadataSource classes, ingested in order
             entries()       override (extend with super().entries()) to contribute more entries
         '''
-        FIELDS: ClassVar[frozenset[str]] = frozenset({'title', 'description', 'tags', 'target', 'extension'})
-        _HID = re.compile(r'\d+(\.\d+)*')
+        FIELDS: ClassVar[frozenset[str]] = frozenset({'title', 'description', 'tags', 'links', 'extension'})
 
         path:           ClassVar[str] = ''
         static_sources: ClassVar[Sequence[Any]] = ()
@@ -1001,88 +1114,127 @@ class BaseSource(abc.ABC):
                 self.errors:   list[str] = []
                 self.warnings: list[str] = []
 
-        def entries(self) -> Iterator[tuple[str, dict[str, Any]]]:
-            '''Every (hid, fields) this source contributes. Default: `static_sources` in order.'''
+        @staticmethod
+        def _split(static: Any) -> tuple[Mid | None, Any]:
+            '''A static_sources item is `Source`'''
+            if isinstance(static, tuple) and len(static) == 2:
+                return static
+            return None, static
+
+        def entries(self) -> Iterator[tuple[str | Address, dict[str, Any]]]:
+            '''Every (Address, fields) this source contributes. Default: `static_sources` in order.'''
             for static in self.static_sources:
-                yield from static.iter_entries()
+                mid, owner = self._split(static)
+                for key, fields in owner.iter_entries():
+                    if mid is not None and isinstance(key, str):
+                        try:
+                            key = (mid, parse_hid(key))
+                        except ValueError:
+                            pass  # left as is, check_entry reports it
+                    yield key, fields
 
         @classmethod
-        def check_entry(cls, hid: Any, fields: Any) -> str | None:
+        def check_entry(cls, address: Any, fields: Any, mids: AbstractSet[Mid] | None) -> str | None:
             '''Return what is wrong with one entry, or None.'''
-            if not isinstance(hid, str) or not cls._HID.fullmatch(hid):
-                return f'hid {hid!r} is not dotted integers'
+            if not is_address(address):
+                return f'key {address!r} is not an Address (mid, hid)'
+            label = address_to_key(address)
+            if mids is not None and address[0] not in mids:
+                return f'{label}: namespace {address[0]} is not defined by the tree (defined: {sorted(mids)})'
             if not isinstance(fields, dict):
-                return f'{hid}: fields must be a dict, got {type(fields).__name__}'
+                return f'{label}: fields must be a dict, got {type(fields).__name__}'
             if unknown := set(fields) - cls.FIELDS:
-                return f'{hid}: unknown field(s) {sorted(unknown)}'
+                return f'{label}: unknown field(s) {sorted(unknown)}'
             for key in ('title', 'description'):
-                if fields.get(key) is not None and not isinstance(fields[key], str):
-                    return f'{hid}: {key} must be str, got {fields[key]!r}'
+                if fields.get(key) is not None and not (isinstance(fields[key], str) or is_address(fields[key])):
+                    return f'{label}: {key} must be str or Address, got {fields[key]!r}'
             tags = fields.get('tags')
             if tags is not None and not (isinstance(tags, (list, tuple)) and all(isinstance(t, str) and t for t in tags)):
-                return f'{hid}: tags must be a list/tuple of non-empty str, got {tags!r}'
-            target = fields.get('target')
-            if target is not None and not (isinstance(target, (list, tuple)) and target and all(isinstance(i, int) for i in target)):
-                return f'{hid}: target must be a non-empty tuple of int, got {target!r}'
+                return f'{label}: tags must be a list/tuple of non-empty str, got {tags!r}'
+            links = fields.get('links')
+            if links is not None:
+                if not isinstance(links, (list, tuple)):
+                    return f'{label}: links must be a list/tuple of Addresses, got {links!r}'
+                for link in links:
+                    if not is_address(link):
+                        return f'{label}: links must be an Address (mid, hid), got {link!r}'
+                    if mids is not None and link[0] not in mids:
+                        return f'{label}: linked namespace {link[0]} is not defined by the tree (defined: {sorted(mids)})'
             ext = fields.get('extension')
             if ext is not None and not (isinstance(ext, str) and ext.startswith('.') and len(ext) > 1):
-                return f'{hid}: extension must look like ".ext", got {ext!r}'
+                return f'{label}: extension must look like ".ext", got {ext!r}'
             return None
 
-        def _screen(self, entries: Iterator[tuple[str, dict[str, Any]]], report: BaseSource.Metadata.Report) -> Iterator[tuple[str, dict[str, Any]]]:
+        def _screen(
+            self,
+            entries: Iterator[tuple[str | Address, dict[str, Any]]],
+            report:  BaseSource.Metadata.Report,
+            mids:    AbstractSet[Mid] | None = None,
+        ) -> Iterator[tuple[str | Address, dict[str, Any]]]:
             '''Yield only valid entries, recording invalid ones and conflicting overwrites in `report`.'''
-            seen: dict[str, dict[str, Any]] = {}
-            for hid, fields in entries:
-                problem = self.check_entry(hid, fields)
+            seen: dict[str | Address, dict[str, Any]] = {}
+            for address, fields in entries:
+                problem = self.check_entry(address, fields, mids)
                 if problem:
                     report.errors.append(problem)
                     continue
-                prior = seen.setdefault(hid, {})
-                for key in ('title', 'description', 'target', 'extension'):  # tags merge, the rest overwrite
+                label = address_to_key(address)
+                prior = seen.setdefault(address, {})
+                for key in ('title', 'description', 'links', 'extension'):  # tags merge, the rest overwrite
                     new = fields.get(key)
                     if new is None:
                         continue
+                    if key == 'links':
+                        new = tuple(new)
                     if key in prior and prior[key] != new:
-                        report.warnings.append(f'{hid}: {key} overwritten ({prior[key]!r} -> {new!r})')
+                        report.warnings.append(f'{label}: {key} overwritten ({prior[key]!r} -> {new!r})')
                     prior[key] = new
                 report.count += 1
-                yield hid, fields
+                yield address, fields
 
-        def audit(self) -> BaseSource.Metadata.Report:
+        def audit(self, mids: AbstractSet[Mid] | None = None) -> BaseSource.Metadata.Report:
             '''Dry-run the ingestion pipeline without a store.'''
             report = self.Report()
-            for _ in self._screen(self.entries(), report):
+            for _ in self._screen(self.entries(), report, mids):
                 pass
             return report
 
         def build(self, store: NodeMetadataStore) -> int:
             '''Build a metadata store from scratch through the checked pipeline. Invalid entries are skipped and logged.'''
             report = self.Report()
-            count = store.register_many(self._screen(self.entries(), report))
+            count  = store.register_many(self._screen(self.entries(), report))
+            name   = type(self.source).__name__
             for line in report.errors[:20]:
-                logger.error(f'{self.source.__class__.__name__} metadata: skipped {line}')
+                logger.error(f'{name} metadata: skipped {line}')
             if report.warnings:
-                logger.warning(f'{self.source.__class__.__name__} metadata: {len(report.warnings)} overwritten field(s), first: {report.warnings[0]}')
+                logger.warning(f'{name} metadata: {len(report.warnings)} overwritten field(s), first: {report.warnings[0]}')
             return count
 
         @classmethod
         def validate(cls, source: type[BaseSource]) -> None:
-            name = source.__name__
+            name = f'{source.__name__}.Metadata'
             if cls.path and not cls.path.endswith('.json'):
-                raise TypeError(f'{name}.Metadata.path must be a .json path, got {cls.path!r}.')
+                raise TypeError(f'{name}: path must be a .json path, got {cls.path!r}.')
             for static in cls.static_sources:
-                if not callable(getattr(static, 'iter_entries', None)):
-                    raise TypeError(f'{name}.Metadata.static_sources: {static!r} has no iter_entries().')
-            report = cls(source()).audit()
-            if report.count and not cls.path:
-                raise TypeError(f'{name}.Metadata produces {report.count} entries but defines no `path`.')
+                mid, owner = cls._split(static)
+                if mid is not None and not (isinstance(mid, int) and not isinstance(mid, bool) and mid >= 0):
+                    raise TypeError(f'{name}.static_sources: the namespace of {owner!r} must be an int >= 0, got {mid!r}.')
+                if not callable(getattr(owner, 'iter_entries', None)):
+                    raise TypeError(f'{name}: Metadata.static_sources: {owner!r} has no iter_entries().')
+
+        def ensure_valid(self, tree: Tree | None = None) -> None:
+            '''Audit entries and raise if any is invalid.'''
+            name = f'{type(self.source).__name__}.Metadata'
+            report = self.audit(set(tree.namespaces) if tree is not None else None)
+            if report.count and not self.path:
+                raise TypeError(f'{name}: Metadata produces {report.count} entries but defines no `path`.')
             if report.errors:
                 raise ValueError(
-                    f'{name}.Metadata ingestion has {len(report.errors)} invalid entr{"y" if len(report.errors) == 1 else "ies"}, '
+                    f'{name}: ingestion has {len(report.errors)} invalid entr{"y" if len(report.errors) == 1 else "ies"}, '
                     f'first: {"; ".join(report.errors[:5])}'
                 )
             if report.warnings:
-                logger.warning(f'{name}.Metadata: {len(report.warnings)} field(s) overwritten by a later source, first: {report.warnings[0]}')
+                logger.warning(f'{name}: {len(report.warnings)} field(s) overwritten by a later source, first: {report.warnings[0]}')
 
     class Patches(Component):
         '''Specify any custom patching logic.'''
@@ -1150,7 +1302,7 @@ class BaseSource(abc.ABC):
 
         class BaseVirtualPatch(BasePatch):
             '''
-            Delegated virtual patch. Runs through a Leaf or Container handler `action` on node `hid`.
+            Delegated virtual patch. Runs through a Leaf or Container handler `action` on node `address`.
 
             Must implement:
                 action      the handler action name
@@ -1237,127 +1389,6 @@ class BaseSource(abc.ABC):
                         raise ValueError(f'{source.__name__} has more than one patch with name, {patch.name!r}')
                     seen.add(patch.name)
 
-    class Builder(abc.ABC):
-        '''
-        Plans and writes a rebuilt source. A source declares `class Builder:`; create it with
-        source.create_builder(...).
-
-        Must Implement:
-            build_layout()              add every region front to back with add_region()
-
-        Entrypoint (do not override):
-            build(dist, task_handle)    build_layout() > resolve_offsets() > write_all(), return bytes_written
-
-        Available to build_layout:
-            source, geometry, handle, source_root, vfs_root, staged, flags, toc, pvd, gap_nodes
-            patch_plan / patches_for(node)  active patches
-            rebuild_context / lba_of(name)  named regions, readable by patches
-            has_flag(flag)                  was the rebuild requested with this flag
-            Regions                         region types, e.g. self.Regions.RawCopy(...)
-            log(message)                    progress message to the UI
-        '''
-        class Regions:
-            '''Region types a layout is built from. Aliased so builders don't need to import a bunch of classes.'''
-            Region        = DiskRegion
-            RawCopy       = RawCopyRegion
-            StagedData    = StagedDataRegion
-            ZeroFill      = ZeroFillRegion
-            Align         = AlignRegion
-            PadToLba      = PadToLbaRegion
-            Sentinel      = SentinelRegion
-            Toc           = TocRegion
-            RootDirectory = RootDirectoryRegion
-            BinaryPatch   = BinaryPatchRegion
-
-        def __init__(
-            self,
-            *,
-            source: BaseSource,
-            handle: BlockDevice,
-            log:    Callable[[str], None] | None = None,
-        ) -> None:
-            self.source   = source
-            self.geometry = source.geometry
-            self.handle   = handle
-            self.log      = log or (lambda message: None)
-
-            self.staged: frozenset[VfsNode] = frozenset()
-            self.flags:  SourceRebuildFlags = cast(Any, source.rebuild_flags).NONE
-            self._reset_layout()
-
-        def _reset_layout(self) -> None:
-            self.planner: DiskLayoutPlanner = DiskLayoutPlanner()
-            self.named:   dict[str, DiskRegion] = {}
-            self.rebuild_context = RebuildContext(regions=self.named, sector_size=self.geometry.sector_size)
-            self.patch_plan = self.source.patches.plan(self.handle, self.flags)
-
-        ### Contract
-        @abc.abstractmethod
-        def build_tree(self) -> VfsNode:
-            '''Read the source into a VfsNode tree and return its root.'''
-
-        @abc.abstractmethod
-        def build_layout(self) -> None:
-            '''subclasses must implement this method to build the layout, by calling self.add_region() sequentially'''
-
-        ### Entrypoint
-        def build(
-            self,
-            dst:            BinaryIO,
-            task_handle:    TaskHandle,
-            *,
-            staged:         frozenset[VfsNode],
-            flags:          SourceRebuildFlags,
-            handle:         BlockDevice | None = None,
-            progress_every: int = 1
-        ) -> int:
-            '''Plan, resolve and write a new source. Returns the number of bytes written.'''
-            self.build_layout()
-            self.log(f'Resolving physical disk layout offsets for {len(self.planner.regions)} regions')
-            self.planner.resolve_offsets()
-            self.log('Starting sequential write...')
-            return self.planner.write_all(dst, task_handle, progress_every)
-
-        ### Helpers
-        def add_region(self, region: DiskRegion, name: str | None = None, alignment: int | None = None) -> DiskRegion:
-            '''Append a region, keyed by name.'''
-            if name is not None:
-                if name in self.named:
-                    raise ValueError(f'Layout already defines a region for name {name!r}')
-                self.named[name] = region
-            return self.planner.add(region, alignment=alignment)
-
-        def lba_of(self, name: str) -> int:
-            return self.rebuild_context.lba_of(name)
-
-        def patcher_for(self, node: VfsNode) -> Callable[[bytearray], None] | None:
-            '''Byte patcher for the node.'''
-            if not self.patch_plan.covers(node):
-                return None
-            return self.patch_plan.patcher(node, self.rebuild_context)
-
-        def has_flag(self, flag: SourceRebuildFlags | str) -> bool:
-            '''True if rebuild was requested with the flag'''
-            if isinstance(flag, str):
-                member = get_member(self.flags, flag)
-                return member is not None and bool(self.flags & member)
-            return bool(self.flags & flag)
-
-        ### Tree helper
-        def resolve_boundary(self, root: VfsNode) -> VfsNode:
-            '''Return the node that represents the boundary between the VFS and the ISO.
-            Currently only supports a single boundary node.
-            Default: scan the root node's children for `.is_boundary`'''
-            if root.children and root.children[-1].is_boundary:
-                return root.children[-1]
-            for child in root.children:
-                if child.is_boundary:
-                    return child
-            boundary = VfsNode()
-            boundary.is_boundary = True
-            root.append_child(boundary)
-            return boundary
-
     ### Component Access
     @cached_property
     def extensions(self) -> Extensions:
@@ -1368,20 +1399,12 @@ class BaseSource(abc.ABC):
         return self.Packages(self)
 
     @cached_property
-    def namespaces(self) -> Namespaces:
-        return self.Namespaces(self)
-
-    @cached_property
     def metadata(self) -> Metadata:
         return self.Metadata(self)
 
     @cached_property
     def patches(self) -> Patches:
         return self.Patches(self)
-
-    def create_builder(self, **kwargs: Any) -> Builder:
-        '''Instantiate this source's Builder'''
-        return self.builder(source=self, **kwargs)
 
     ### Registration check
     @classmethod
@@ -1391,7 +1414,7 @@ class BaseSource(abc.ABC):
         for attr in ('hidden_toc_indices', 'runtime_file_names'):
             if not isinstance(getattr(cls, attr), frozenset):
                 raise TypeError(f"[{name}] '{attr}' must be a frozenset to prevent cross-rebuild state mutation.")
-        for attr in ('display_name', 'toc_total_entries', 'rebuild_flags'):
+        for attr in ('display_name', 'rebuild_flags'):
             if not hasattr(cls, attr):
                 raise TypeError(f'{name} must define `{attr}`.')
         if inspect.isabstract(cls):
@@ -1401,7 +1424,7 @@ class BaseSource(abc.ABC):
         none_flag = cls.rebuild_flags.__members__.get('NONE')
         if none_flag is None or none_flag.value != 0:
             raise TypeError(f'{name}.rebuild_flags must define NONE = 0 (the no-patch flag).')
-        for attr in ('extensions', 'packages', 'namespace', 'metadata', 'patches'):
+        for attr in ('extensions', 'packages', 'metadata', 'patches'):
             if not isinstance(inspect.getattr_static(cls, attr), cached_property):
                 raise TypeError(f'{name}.{attr} is reserved for the component instance; declare `class {attr.capitalize()}:` instead.')
         for attr in BaseSource.COMPONENTS:
@@ -1409,10 +1432,4 @@ class BaseSource(abc.ABC):
             component: Any = getattr(cls, attr)
             if not (isinstance(component, type) and issubclass(component, base)):
                 raise TypeError(f'{name}.{attr} must be a class that subclasses BaseSource.{attr}, got {component!r}.')
-            if attr == 'Builder':
-                if component is base:
-                    raise TypeError(f'{name} must define `class Builder(BaseSource.Builder)`. Tree and Layout and source specific.')
-                if inspect.isabstract(component):
-                    raise TypeError(f'{name}.Builder is abstract; implement {sorted(component.__abstractmethods__)}.')
-            else:
-                cast(Any, component).validate(cls)
+            cast(Any, component).validate(cls)

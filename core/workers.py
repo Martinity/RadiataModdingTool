@@ -22,7 +22,7 @@ from PyQt6.QtCore import pyqtSignal, QObject, pyqtSlot, QRunnable, QThreadPool, 
 from core.contracts import LeafHandler, ContainerHandler
 from core.native.block_device import BlockDevice
 if TYPE_CHECKING:
-    from core.node import VfsNode, ModTracker
+    from core.node import VfsNode, ModTracker, Address
     from core.contracts import BaseHandler, PhysicalHandler, SourceRebuildFlags
     from core.handlers.iso_container import SourceHandler
     from core.navigator import VfsNavigator
@@ -520,20 +520,21 @@ class Actions:
 
     @staticmethod
     def fetch_for_editor(
-        hid: tuple[int, ...],
+        address: Address,
         navigator: VfsNavigator,
         task_handle: TaskHandle
     ) -> EditorPayload:
         '''
-        Resolves a node for the given HID, and attempts to call it's prepare_editor_data() method.
+        Resolves a node for the given Address, and attempts to call it's prepare_editor_data() method.
+        TODO this feature is not finished. This was how I was going to implement glyph featching for RMF
         '''
-        logger.debug(f'Fetching editor payload for HID {hid}')  # logger to hit dev console
-        raw_bytes = navigator.resolve_data_from_hid(hid) # resolve raw bytes/register the node in VFS
+        logger.debug(f'Fetching editor payload for address {address}')  # logger to hit dev console
+        raw_bytes = navigator.resolve_data_from_address(address) # resolve raw bytes/register the node in VFS
         if not raw_bytes:
-            raise ValueError(f'Could not resolve raw bytes for HID: {hid}. Ensure it exists.')
-        node = navigator.vfs.get_vfs_node_by_id(hid) # resolve node
+            raise ValueError(f'Could not resolve raw bytes for address: {address}. Ensure it exists.')
+        node = navigator.vfs.get_node(address) # resolve node
         if not node:
-            raise ValueError(f'Could not find node for HID: {hid}. Ensure it got expanded.')
+            raise ValueError(f'Could not find node for address: {address}. Ensure it got expanded.')
         from core.registry import Registry
         handler_class = Registry.get_handler(node) # resolve handler
         if not handler_class:
@@ -541,7 +542,7 @@ class Actions:
         task_handle.checkpoint()
         with navigator.open_handler(handler_class, node, task_handle, raw_bytes) as handler:
             result = handler.prepare_editor_data(node, raw_bytes)
-        logger.debug(f'fetch_for_editor: {hid} -> {type(result).__name__} from {handler_class.__name__}')
+        logger.debug(f'fetch_for_editor: {address} -> {type(result).__name__} from {handler_class.__name__}')
         return EditorPayload(node=node, data=result)
 
     ### Entry point for all node actions

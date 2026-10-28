@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.node import ModTracker, ModGroup, ConflictInfo
+from core.node import ModTracker, ModGroup, ConflictInfo, Address
 from core.contracts import SourceRebuildFlags
 from ui.settings import Shortcut, Shortcuts
 
@@ -246,7 +246,7 @@ class StagingPage(QWidget):
         self.dispatcher          = dispatcher
         self.rebuild_coordinator = rebuild_coordinator
         self.tracker: ModTracker = self.dispatcher.tracker
-        self._selected_group_key: str | None = None
+        self._selected_group_key: Address | None = None
         self._option_boxes:       dict[SourceRebuildFlags, QCheckBox] = {}
         self._setup_ui()
         self._connect_signals()
@@ -408,12 +408,12 @@ class StagingPage(QWidget):
         for group in self.tracker.unstaged_groups():
             item = _make_item(group, self.tracker.group_conflicts(group))
             self.unstaged_list.addItem(item)
-            if self._selected_group_key == group.primary.hierarchical_id_str:
+            if self._selected_group_key == group.primary.address:
                 self.unstaged_list.setCurrentItem(item)
         for group in self.tracker.staged_groups():
             item = _make_item(group, [])
             self.staged_list.addItem(item)
-            if self._selected_group_key == group.primary.hierarchical_id_str:
+            if self._selected_group_key == group.primary.address:
                 self.staged_list.setCurrentItem(item)
         self.btn_confirm.setEnabled(len(self.tracker.rebuild_queue) > 0)
 
@@ -423,7 +423,7 @@ class StagingPage(QWidget):
             self._selected_group_key = None
             self.diff_panel.clear()
             return
-        self._selected_group_key = group.primary.hierarchical_id_str
+        self._selected_group_key = group.primary.address
         self.diff_panel.load_group([
             (f'{node}', node.pending_data or b'', self.tracker.get_original(node))
             for node in group.members

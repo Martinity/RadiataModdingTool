@@ -24,7 +24,7 @@ from typing import NamedTuple, Callable, TYPE_CHECKING, Iterator, Sequence, Type
 from PyQt6.QtCore import pyqtSignal, QObject
 if TYPE_CHECKING:
     from core.handlers.compression_container import CompressorHandler
-    from core.contracts import BaseSource, LinkLookup
+    from core.contracts import BaseSource
 
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
@@ -57,8 +57,8 @@ class VfsNode:
         header:    bytes = b'',
         extension: str | None = None,
         parent:    VfsNode | None = None,
-        hid:       tuple[int, ...] = (),
-        target:    tuple[int, ...] | None = None,
+        hid:       Hid = (),
+        links:     Sequence[Address] = (),
     ):
         self.name     = name                                # semantic name from overrides
         self.category = category                            # semantic category derived from disk index
@@ -68,14 +68,14 @@ class VfsNode:
         # offset and size are set synchronously at init but are lock protected after since they are mutable from background threads
         self._offset = offset                               # Relative offset into parent
         self._size   = size                                 # Size of node in bytes (VirtualFile=disk[offset:offset+size])
-        self.target: tuple[int,...] | None = target         # Header HID for unpacking datacenter
+        self.links: tuple[Address, ...] = tuple(links)      # Address for dependent package member
 
         self.extension = extension                          # extension from override saved in radi_metadata
-        self.parent_header: CompressorHandler.SlzHeader | bytes | None = None    # Original header of the parent node used for rebuilding children
+        self.parent_header: CompressorHandler.SlzHeader | bytes | None = None    # Original header of the parent node used for rebuilding children TODO make generic
         self.logical_id: int | None = None                  # Logical ID from the TOC used for ISO rebuilding
 
-        self._id_path: Hid = hid                            # hierarchical id (root, sub, subsub)
-        self.mid:     Mid = PHYSICAL                       # the namespace this node belongs to
+        self._id_path: Hid = hid                            # hierarchical id, relative to the node's namespace root
+        self.mid:     Mid = PHYSICAL                        # the namespace this node belongs to
         self.mount_id: Mid | None = None                    # set when the node is itself the namespace root
 
         self.status = NodeStatus.UNMODIFIED                 # node state
@@ -102,8 +102,7 @@ class VfsNode:
             child.mid, child._id_path = self.mount_id, (row,)
 
     def append_child(self, child: VfsNode):
-        '''
-        Called to add a child node to this node. Keeps separate HID increments per namespace.'''
+        '''Called to add a child node to this node. Keeps separate HID increments per namespace.'''
         with self._lock:
             self.children.append(child)
             self._place(child, len(self.children) - 1)
@@ -279,6 +278,89 @@ class VfsNode:
     def __repr__(self) -> str:
         return f'{self.name}{self.extension} ({self.hierarchical_id_str})'
 
+###------------------------------------------------- Tree ------------------------------------------------------###
+
+@dataclass(frozen=True)
+class Namespace:
+    '''A namespace a source defines: a hierarchical tree with it's own HID space.'''
+    mid:      Mid
+    label:    str = ''
+    metadata: type[BaseSource.Metadata] | None = None
+    mounts:   Callable[[VfsNode], bool] | None = None
+
+    @property
+    def opened(self) -> bool:
+        return self.mounts is None
+
+class Tree:
+    '''
+    The shape of a source's filesystem: the namespaces that a source defines to make up a
+    physical image. VfsManager stores it and the namespaces that are currently accessible.
+
+    Only the physical namespace (the image itself) exists inherintly, all others are defined by the source.
+
+        tree.mount(mid, ...)    open a namespace and return its root attached on a node in the parent namespace
+        tree.lazy(mid, mounts)  a lazy registered namespace attached as an existing namespace under a parent
+        tree.default            the namespace the tool sees by default. Will change the current viewed tree in the browser
+                                in the future this can be used if it's preferred to add paging to the tree browser
+    '''
+    def __init__(self, root: VfsNode) -> None:
+        self.root = root
+        self.namespaces: dict[Mid, Namespace] = {PHYSICAL: Namespace(PHYSICAL, 'Image')}
+        self.hosts:      dict[Mid, VfsNode]   = {PHYSICAL: root}
+        self.default:    Mid | None = None
+
+    def _define(self, namespace: Namespace) -> None:
+        mid = namespace.mid
+        if not isinstance(mid, int) or isinstance(mid, bool) or mid < 0:
+            raise ValueError(f'Namespace ids must be ints >= 0, got {mid}')
+        if mid in self.namespaces:
+            raise ValueError(f'Namespaces {mid} is already defined')
+        self.namespaces[mid] = namespace
+
+    def mount(
+        self,
+        mid: Mid,
+        *,
+        label:    str = '',
+        metadata: type[BaseSource.Metadata] | None = None,
+        default:  bool = False,
+        host:     VfsNode | None = None,
+    ) -> VfsNode:
+        self._define(Namespace(mid, label, metadata))
+        if host is None:
+            host = VfsNode(name=label or f'namespace {mid}')
+            self.root.append_child(host)
+        host.mount_id = mid
+        self.hosts[mid] = host
+        if default:
+            if self.default not in (None, mid):
+                raise ValueError(f'Namespace {self.default} is already the default')
+            self.default = mid
+        return host
+
+    def lazy(
+        self,
+        mid: Mid,
+        mounts: Callable[[VfsNode], bool],
+        *,
+        label: str = '',
+        metadata: type[BaseSource.Metadata] | None = None
+    ) -> None:
+        self._define(Namespace(mid, label, metadata, mounts))
+
+    @property
+    def opened(self) -> frozenset[Mid]:
+        '''Namespaces mounted at source open. VfsManager keeps them for as long as the source is open.'''
+        return frozenset(mid for mid, namespace in self.namespaces.items() if namespace.opened)
+
+    def mount_point(self, node: VfsNode) -> Mid | None:
+        '''For Vfsmanager: the lazily mounted namespace this new node roots, or None.'''
+        for mid, namespace in self.namespaces.items():
+            if namespace.mounts is not None and namespace.mounts(node):
+                return mid
+        return None
+
 ###------------------------------------------------------- VFS Manager -----------------------------------------------------###
 
 class HidSnapshot(NamedTuple):
@@ -308,10 +390,8 @@ class VfsManager(QObject):
 
     def __init__(
         self,
-        root:          VfsNode,
-        default:       Mid = DEFAULT,
+        tree:          Tree,
         node_enricher: Callable[[VfsNode], None] | None = None,
-        mount_point:   Callable[[VfsNode], Mid | None] | None = None,
     ) -> None:
         '''
         default         the namespace the UI works in
@@ -319,17 +399,18 @@ class VfsManager(QObject):
         mount_point     mount ids for namespaces that are lazily discovered
         '''
         super().__init__()
-        self.root        = root
-        self.default     = default
+        self.tree        = tree
+        self.root        = tree.root
+        self.opened     = tree.opened
         self.enrich_node = node_enricher
-        self.mount_point = mount_point
+        self.mount_point = tree.mount_point
         self._lock       = threading.RLock()
 
         self._namespaces:      dict[Mid, dict[Hid, VfsNode]] = {}   # accessible namespaces
         self.physical_offsets: dict[VfsNode, int] = {}              # Physical disk map
         self._register_recursive(self.root)
-        if default not in self._namespaces:
-            raise ValueError(f'Default namespace {default} has no mount point in the tree!')
+        if missing := self.opened - self._namespaces.keys():
+            raise ValueError(f'Opened namespace(s) {sorted(missing)} are not accessible in the tree!\nCurrently accessible: {sorted(self._namespaces)}')
 
     @property
     def accessible(self) -> frozenset[Mid]:
@@ -371,7 +452,7 @@ class VfsManager(QObject):
             claimed: set[Mid] = set()
             for i, child in enumerate(new_children):  # Place and classify before the tree is touched, conflicts raised
                 parent._place(child, base_idx + i)
-                if self.mount_point and (mid := self.mount_point(child)) is not None:
+                if (mid := self.mount_point(child)) is not None:
                     child.mount_id = mid
                 if child.mount_id is not None:
                     if child.mount_id in claimed or () in self._namespaces.get(child.mount_id, {}):
@@ -402,10 +483,11 @@ class VfsManager(QObject):
         if not self.enrich_node:
             return
         with self._lock:
-            for mid, table in self._namespaces.items():
-                if mid == PHYSICAL != self.default:
+            for mid in sorted(self.opened):
+                if mid == PHYSICAL and len(self.opened) > 1:
                     continue
-                logger.warning(f'Enriching initial tree, the children of {table[()]}')
+                table = self._namespaces[mid]
+                logger.warning(f'Enriching initial tree, the children of {table[()]} (namespace {mid})')
                 for child in table[()].children:
                     self.enrich_node(child)
                     if child.mount_id is not None:
@@ -419,7 +501,7 @@ class VfsManager(QObject):
     def _is_anchor(self, node: VfsNode) -> bool:
         '''The tree root and the mount points of the physical and default namespaces.
         TODO: update to modular based on init time registered namespaces.'''
-        return node is self.root or node.mount_id in (PHYSICAL, self.default)
+        return node is self.root or node.mount_id in (PHYSICAL, self.tree.default)
 
     def _drop_namespace(self, node: VfsNode) -> None:
         '''Removing a root should remove the namespace'''
@@ -674,10 +756,10 @@ class ModTracker(QObject):
         self._group_of:      dict[VfsNode, ModGroup] = {}
         self._next_group:    int = 0
         self._source:        BaseSource | None = None
-        self._links:         LinkLookup | None = None
+        self._links:         BaseSource.Packages.LinkLookup | None = None
         self._lock = threading.RLock()
 
-    def configure_source(self, source: BaseSource | None, links: LinkLookup | None) -> None:
+    def configure_source(self, source: BaseSource | None, links: BaseSource.Packages.LinkLookup | None) -> None:
         with self._lock:
             self._source = source
             self._links = links
@@ -979,7 +1061,7 @@ class ModTracker(QObject):
         pending = self._pending_excluding(incoming_node, exclude)
         if not pending:
             return []
-        return [ConflictInfo(f.other, f.reason) for f in self._source.find_conflicts(incoming_node, pending, self._links)]
+        return [ConflictInfo(f.other, f.reason) for f in self._source.packages.conflicts(incoming_node, pending, self._links)]
 
     def _conflicts_for(
         self,
