@@ -156,7 +156,7 @@ class TreeProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.show_hidden  = False
-        self.setRecursiveFilteringEnabled(True)
+        # self.setRecursiveFilteringEnabled(True)
         self.setSortCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
@@ -178,13 +178,12 @@ class TreeProxyModel(QSortFilterProxyModel):
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        index = self.source_model.index(source_row, 0 , source_parent)
-        node = index.data(Qt.ItemDataRole.UserRole)
-        if not node:
-            return False
-        if not self.show_hidden and node.is_hidden:
-            return False
-        return True
+        '''Computed without an index() Qt roundtrip to save the interfacing time.'''
+        if self.show_hidden:
+            return True
+        parent = self.source_model.get_node(source_parent)
+        kids = parent.children
+        return source_row < len(kids) and not kids[source_row].is_hidden
 
     @property
     def source_model(self) -> QAbstractItemModel:
