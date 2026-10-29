@@ -156,7 +156,6 @@ class TreeProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.show_hidden  = False
-        # self.setRecursiveFilteringEnabled(True)
         self.setSortCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
