@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from PyQt6.QtCore import QAbstractItemModel, QModelIndex, Qt, QSortFilterProxyModel, QAbstractListModel, QTimer
 from PyQt6.QtGui import QColor
-from core.node import VfsManager
+from core.node import VfsManager, Address
+from core.metadata_manager import key_to_address, address_to_key
 from utilities import human_size
 if TYPE_CHECKING:
     from core.node import VfsNode
@@ -92,7 +93,7 @@ class VfsTreeModel(QAbstractItemModel):
         if role == Qt.ItemDataRole.DisplayRole:
             col = index.column()
             if col == 0:
-                return node.hierarchical_id_str
+                return address_to_key(node.address)
             if col == 1:
                 return node.name + node.extension if node.extension else node.name
             if col == 2:
@@ -166,7 +167,7 @@ class TreeProxyModel(QSortFilterProxyModel):
             return super().lessThan(left, right)
         col = left.column()
         if col == 0:
-            return list(left_node.hierarchical_id) < list(right_node.hierarchical_id)
+            return left_node.address < right_node.address
         if col == 2:
             return left_node.size < right_node.size
         return super().lessThan(left, right)
@@ -194,7 +195,7 @@ class TreeProxyModel(QSortFilterProxyModel):
 ### -------------------------------------- Flat Search Model -------------------------------------------###
 
 _RANK_EXACT_NAME  = 100
-_RANK_HID         = 90
+_RANK_ADDRESS         = 90
 _RANK_NAME_PREFIX = 80
 _RANK_EXTENSION   = 70
 _RANK_NAME        = 60
@@ -203,9 +204,9 @@ _RANK_DESCRIPTION = 10
 
 @dataclass
 class _SearchEntry:
-    '''Stores: node*, name, hid, ext, tokens, base_rank, tags. Calculates score.'''
+    '''Stores: node*, name, address, ext, tokens, base_rank, tags. Calculates score.'''
     node:       VfsNode | None
-    hid_str:    str
+    address:    str
     name_lower: str
     ext_lower:  str
     desc_lower: str
@@ -216,6 +217,11 @@ class _SearchEntry:
     @property
     def is_resolved(self) -> bool:
         return self.node is not None
+
+    def _matches_address(self, query: str) -> bool:
+        if ':' in query:
+            return self.address.startswith(query)
+        return self.address.partition(':')[2].startswith(query)
 
     def score(self, query: str) -> int:
         '''return score for query. Higher is more relevant'''
@@ -243,8 +249,8 @@ class _SearchEntry:
                 if val in self.name_lower:
                     return _RANK_NAME + self.base_rank
                 return 0
-            if prefix == 'hid': # HID filter
-                return _RANK_HID if self.hid_str.startswith(val) else 0
+            if prefix == 'address': # Address filter
+                return _RANK_ADDRESS if self._matches_address(val) else 0
 
         # Global Search
         if query == self.name_lower: # Name exact
@@ -253,8 +259,8 @@ class _SearchEntry:
             return _RANK_NAME_PREFIX + self.base_rank
         if query in self.name_lower: # Name contains
             return _RANK_NAME + self.base_rank
-        if self.hid_str.startswith(query) or query == self.hid_str: # HID match
-            return _RANK_HID
+        if self._matches_address(query): # Address match
+            return _RANK_ADDRESS
         for token in self.tokens:
             if query == token: # Exact token match
                 return _RANK_TAG + self.base_rank if self.base_rank > 0 else _RANK_DESCRIPTION
@@ -279,7 +285,7 @@ class FlatSearchModel(QAbstractListModel):
         self._index:      list[_SearchEntry] = []
         self._results:    list[_QueryResult] = []
         self._query       = ''
-        self._hid_to_idx: dict[str, int] = {}
+        self._address_to_idx: dict[str, int] = {}
         self._built       = False  # deferred: index is built on first set_query call
 
         metadata_store.entry_registered.connect(self._on_entry_registered)
@@ -307,12 +313,12 @@ class FlatSearchModel(QAbstractListModel):
 
         if role == Qt.ItemDataRole.DisplayRole: # Name
             if entry.node:
-                return f'{entry.node.name}{entry.node.extension} ({entry.hid_str})'
+                return f'{entry.node.name}{entry.node.extension} ({entry.address})'
             else:
-                meta    = self._store.get(entry.hid_str)
-                title   = meta.title if (meta and meta.title) else f'Unresolved ({entry.hid_str})'
+                meta    = self._store.get(entry.address)
+                title   = meta.title if (meta and meta.title) else f'Unresolved ({entry.address})'
                 ext_str = meta.extension if meta and meta.extension else ''
-                return f'{title}{ext_str} ({entry.hid_str})'
+                return f'{title}{ext_str} ({entry.address})'
         if role == Qt.ItemDataRole.UserRole: # Node
             return entry
         if role == self.TagsRole: # Tags
@@ -320,8 +326,8 @@ class FlatSearchModel(QAbstractListModel):
         if role == self.ResolvedRole:
             return entry.is_resolved
         if role == Qt.ItemDataRole.ToolTipRole: # ToolTip
-            meta = self._store.get(entry.hid_str)
-            parts = [entry.hid_str]
+            meta = self._store.get(entry.address)
+            parts = [entry.address]
             if meta and meta.description:
                 parts.append(meta.description)
             if not entry.is_resolved:
@@ -378,15 +384,15 @@ class FlatSearchModel(QAbstractListModel):
 
     ### Index Population
     def _build_from_store(self) -> None:
-        '''Index every descriptor entry. Skips entries already in _hid_to_idx
+        '''Index every descriptor entry. Skips entries already in _address_to_idx
         (added by _on_entry_registered before the lazy build ran).'''
         store_items = self._store._db.items()
         added = 0
-        for hid_str, meta in store_items:
-            if hid_str in self._hid_to_idx:
+        for key, meta in store_items:
+            if key in self._address_to_idx:
                 continue  # already added by a signal handler before the lazy build
-            entry = self._build_uninstantiated_entry(hid_str, meta)
-            self._hid_to_idx[hid_str] = len(self._index)
+            entry = self._build_uninstantiated_entry(key, meta)
+            self._address_to_idx[key] = len(self._index)
             self._index.append(entry)
             added += 1
         logger.debug(f'FlatSearchModel: _build_from_store added {added} entries (total {len(self._index)})')
@@ -421,40 +427,40 @@ class FlatSearchModel(QAbstractListModel):
         if changed and self._query:
             self._recompute_results()
 
-    def _on_entry_registered(self, hid_str: str) -> None:
+    def _on_entry_registered(self, key: str) -> None:
         '''Called when new entries are added to the metadata store'''
-        meta = self._store.get(hid_str)
+        meta = self._store.get(key)
         if meta is None:
             return
-        if hid_str in self._hid_to_idx:
-            self._on_entry_updated(hid_str)
+        if key in self._address_to_idx:
+            self._on_entry_updated(key)
             return
-        node = self._vfs.get_vfs_node_by_id(tuple(map(int, hid_str.split('.'))))
+        node = self._vfs.get_node(key_to_address(key))
         entry = (
             self._build_entry(node)
             if node and not node.is_hidden
-            else self._build_uninstantiated_entry(hid_str, meta)
+            else self._build_uninstantiated_entry(key, meta)
         )
         self.beginResetModel()
-        self._hid_to_idx[hid_str] = len(self._index)
+        self._address_to_idx[key] = len(self._index)
         self._index.append(entry)
         self.endResetModel()
         if self._query:
             self._recompute_results()
 
-    def _on_entry_updated(self, hid_str: str) -> None:
+    def _on_entry_updated(self, key: str) -> None:
         '''Called when a metadata store entry is modified'''
-        idx = self._hid_to_idx.get(hid_str)
+        idx = self._address_to_idx.get(key)
         if idx is None:
             return
         existing = self._index[idx]
-        meta = self._store.get(hid_str)
+        meta = self._store.get(key)
         if meta is None:
             return
         self._index[idx] = (
             self._build_entry(existing.node)
             if existing.node
-            else self._build_uninstantiated_entry(hid_str, meta)
+            else self._build_uninstantiated_entry(key, meta)
         )
         if self._query:
             self._recompute_results()
@@ -462,27 +468,27 @@ class FlatSearchModel(QAbstractListModel):
     ### Entry helpers
     def _upgrade_or_append(self, node: VfsNode) -> None:
         '''Upgrade or append an entry'''
-        hid_str = node.hierarchical_id_str
-        if hid_str in self._hid_to_idx: # Upgrade
-            idx = self._hid_to_idx[hid_str]
+        key = address_to_key(node.address)
+        if key in self._address_to_idx: # Upgrade
+            idx = self._address_to_idx[key]
             if not self._index[idx].is_resolved:
                 self._index[idx] = self._build_entry(node)
         else: # New Entry
-            self._hid_to_idx[hid_str] = len(self._index)
+            self._address_to_idx[key] = len(self._index)
             self._index.append(self._build_entry(node))
 
     def _build_entry(self, node: VfsNode) -> _SearchEntry:
         '''Build an instantiated entry from live VFS'''
-        meta            = self._store.get(node.hierarchical_id_str)
+        key:        str = address_to_key(node.address)
+        meta            = self._store.get(key)
         name_lower: str = node.name.lower()
-        hid_str: str    = node.hierarchical_id_str
-        ext_lower: str  = node.extension.lower() if node.extension else (meta.extension.lower() if meta and meta.extension else '')
+        ext_lower:  str = node.extension.lower() if node.extension else (meta.extension.lower() if meta and meta.extension else '')
         desc_lower: str = ''
         tags_lower: tuple[str, ...] = ()
         base_rank  = 0
 
         tokens: set[str] = set(name_lower.split())
-        tokens.add(hid_str)
+        tokens.add(key)
         tokens.update(c.lower() for c in node.category)
         if ext_lower:
             tokens.add(ext_lower.lstrip('.'))
@@ -502,23 +508,23 @@ class FlatSearchModel(QAbstractListModel):
             node=node,
             name_lower=name_lower,
             ext_lower=ext_lower,
-            hid_str=hid_str,
+            address=key,
             desc_lower=desc_lower,
             tags_lower=tags_lower,
             tokens=frozenset(tokens),
             base_rank=base_rank,
         )
 
-    def _build_uninstantiated_entry(self, hid_str: str, meta: Any) -> _SearchEntry:
+    def _build_uninstantiated_entry(self, key: str, meta: Any) -> _SearchEntry:
         '''Build an for a metadata entry, a node not yet in the VFS'''
-        name_lower = (meta.title if meta.title else f'Unresolved ({hid_str})').lower()
+        name_lower = (meta.title if meta.title else f'Unresolved ({key})').lower()
         tags_lower = tuple(t.lower() for t in meta.tags)
         ext_lower  = meta.extension.lower() if meta and meta.extension else ''
         desc_lower = ''
         base_rank  = 0
 
         tokens: set[str] = set(name_lower.split())
-        tokens.add(hid_str)
+        tokens.add(key)
         tokens.update(tags_lower)
         if ext_lower:
             tokens.add(ext_lower.lstrip('.'))
@@ -534,7 +540,7 @@ class FlatSearchModel(QAbstractListModel):
             node=None,
             name_lower=name_lower,
             ext_lower=ext_lower,
-            hid_str=hid_str,
+            address=key,
             desc_lower=desc_lower,
             tags_lower=tags_lower,
             tokens=frozenset(tokens),
@@ -545,7 +551,7 @@ class FlatSearchModel(QAbstractListModel):
         '''Rebuild the entire index. Used when mass metadata updates occur'''
         self.beginResetModel()
         self._index.clear()
-        self._hid_to_idx.clear()
+        self._address_to_idx.clear()
         self._results.clear()
         self._built = True  # cleared above so _build_from_store will add all entries cleanly
         self._build_from_store()

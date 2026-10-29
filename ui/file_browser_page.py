@@ -203,9 +203,7 @@ class FileBrowserBehavior(QObject):
             self.proxy_model.set_show_hidden(self.window.app_settings.show_hidden_files)  # type: ignore
 
         ### Tree View
-        self.view.tree_view.setModel(self.proxy_model)
-        self.view.tree_view.setSortingEnabled(True)
-        self.view.tree_view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.view.tree_view.setModel(self.proxy_model)  # The model sorts with lessThan
 
         ### Search / Filter
         self.search_model = FlatSearchModel(self.dispatcher.vfs, self.metadata_store)
