@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         # Setup metadata database
         self.metadata_store  = NodeMetadataStore(
             get_resource_path('ui/assets/placeholder.json'),
-            auto_save=True,
+            auto_save=False,
             parent=self,
         )
         self.metadata_store.load()
@@ -344,7 +344,8 @@ class MainWindow(QMainWindow):
     def _reload_metadata_for_source(self) -> None:
         handler  = getattr(self.dispatcher, 'active_handler', None)
         source   = getattr(handler, 'source', None)
-        metadata = getattr(source, 'metadata_path', None)
+        metadata = source.Metadata if source else None
+        logger.warning(metadata)
         if metadata is None or not metadata.path:
             return
         resolved = get_resource_path(metadata.path)

@@ -510,7 +510,7 @@ class Dispatcher(QObject):
             self.active_handler.close()
         self.active_handler = handler
         if not self._metadata_store:
-            logger.debug(f'No file metadata loaded... {self._metadata_store}')
+            logger.debug(f'No file metadata loaded... {self._metadata_store._path if self._metadata_store else ''}')
         task_handle = self._start(
             Actions.load_source,
             handler,

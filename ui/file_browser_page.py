@@ -13,7 +13,7 @@ from typing import Any
 
 from core.contracts import BaseEditor
 from core.dispatcher import Dispatcher
-from core.metadata_manager import NodeMetadataStore, address_to_key
+from core.metadata_manager import NodeMetadataStore, address_to_key, key_to_address
 from core.node import VfsNode
 from core.registry import GLOBAL_ACTIONS, Registry
 from core.workers import ActionDef, ActionResult, ActionStatus, ActionType, EditorPayload
@@ -326,8 +326,7 @@ class FileBrowserBehavior(QObject):
         if entry.node:
             self._handle_goto(entry.node)
         else:  # Ghost node
-            hid = tuple(map(int, entry.hid_str.split('.')))
-            self.dispatcher.resolve_ghost_node(entry.address, self._handle_goto)
+            self.dispatcher.resolve_ghost_node(key_to_address(entry.address), self._handle_goto)
 
     def _on_search_double_click(self, index: QModelIndex) -> None:
         """
