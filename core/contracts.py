@@ -1178,7 +1178,7 @@ class BaseSource(abc.ABC):
                 if problem:
                     report.errors.append(problem)
                     continue
-                label = address_to_key(address)
+                label = address_to_key(address) if isinstance(address, tuple) else address
                 prior = seen.setdefault(address, {})
                 for key in ('title', 'description', 'links', 'extension'):  # tags merge, the rest overwrite
                     new = fields.get(key)

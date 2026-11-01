@@ -377,7 +377,7 @@ class MainWindow(QMainWindow):
     def describe_open_error(name: str, err: Exception) -> str:
         '''User-facing text for a failed source open.'''
         if isinstance(err, ValueError):
-            return f'{name} was opened but is not a supported disc:\n{err}'
+            return f'{name}:\n{err}'
         winerr = getattr(err, 'winerror', None)
         code = getattr(err, 'errno', None)
         is_windows = platform.system() == 'Windows'

@@ -2761,7 +2761,7 @@ class RadiataStoriesSource(BaseSource):
                 for slot in range(_MAX_PACK_SLOTS):
                     sub_linked = links.links_of((node.mid, node.hierarchical_id + (slot,)))
                     if sub_linked:
-                        members.append(self.Member(slot_header_role(slot), sub_linked[0], required=True))
+                        members.append(self.Member(slot_header_role(slot), sub_linked[0], required=False)) # not always required such as the case where the slot is empty
             return tuple(members)
 
     class Metadata(BaseSource.Metadata):

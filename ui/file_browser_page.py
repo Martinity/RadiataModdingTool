@@ -376,15 +376,18 @@ class FileBrowserBehavior(QObject):
         if not index.isValid():
             return
         entry = self.search_model.data(index, Qt.ItemDataRole.UserRole)
+        global_pos = self.view.search_results_view.mapToGlobal(position)
         node  = entry.node
-        address = node.address
-        if not node and self.dispatcher.vfs:
-            self.dispatcher.resolve_ghost_node(address, self._handle_goto)
-            node = self.dispatcher.vfs.get_node(address)
-        if not node:
-            logger.error(f'No node found for {address}')
+        if node is not None:
+            self._build_context_menu(node, global_pos)
             return
-        self._build_context_menu(node, self.view.search_results_view.mapToGlobal(position))
+        # ghost node
+        address = key_to_address(entry.address)
+        node = self.dispatcher.vfs.get_node(address)
+        if node is not None:
+            self._build_context_menu(node, global_pos)
+            return
+        self.dispatcher.resolve_ghost_node(address, lambda resolved: self._build_context_menu(resolved, global_pos))
 
     def on_tree_context_menu(self, position) -> None:
         """Prepares the clicked tree node for the context menu builder."""

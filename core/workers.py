@@ -98,8 +98,8 @@ class LoadIsoResult(NamedTuple):
     '''Payload for _on_source_loaded. PhysicalHandler and ISO handling are always dedicated logically.'''
     success: bool
     handler: SourceHandler | None = None
-    root:    VfsNode         | None = None
-    error:   str             | None = None
+    root:    VfsNode       | None = None
+    error:   str           | None = None
 
 def validate_task_signature(fn, args: tuple, kwargs: dict) -> None:
     signature = inspect.signature(fn)
