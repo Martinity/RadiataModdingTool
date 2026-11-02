@@ -1045,24 +1045,29 @@ class BaseSource(abc.ABC):
         def validate(cls, source: type[BaseSource]) -> None:
             '''Raise at registration if the component is incompletely defined.'''
 
+
     class Extensions(Component):
         '''Specify any custom extension resolution logic.'''
         def resolve(self, node: VfsNode, header: bytes) -> str:
             '''Return the node's extension from its header bytes.'''
             return '.bin'
 
+
     class Packages(Component):
         '''Specify any custom package structures.'''
+
         class Intent(Enum):
             '''What a package resolution is for'''
             ACCESS = auto()
             IMPORT = auto()
+
         @dataclass(frozen=True, slots=True)
         class Member:
             '''A single reguired node of a package'''
             role:     str
             address:  Address
             required: bool = True
+
         @runtime_checkable
         class LinkLookup(Protocol):
             '''Resolves links between nodes required to resolve a package.
@@ -1071,7 +1076,7 @@ class BaseSource(abc.ABC):
 
         @dataclass(frozen=True, slots=True)
         class Finding:
-            '''One source-defined filesystem conflic.
+            '''One source-defined filesystem conflict.
             Resolved by ModTracker.'''
             other:  VfsNode
             reason: str
@@ -1093,6 +1098,7 @@ class BaseSource(abc.ABC):
                 elif address in links.links_of(other_address):
                     findings.append(self.Finding(other, f'{other} depends on header from {incoming} which has pending modifications'))
             return findings
+
 
     class Metadata(Component):
         '''

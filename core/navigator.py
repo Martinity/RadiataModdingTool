@@ -6,7 +6,7 @@ thread-isolated node roll-ups for rebuilding the FS.
 
 Traversal API (Physical to Virtual):
     unwrap_chain            - Reads raw bytes from the physical layer up to the target node.
-        |_ build_chain      - Constructs the path from a virtual node down to its physical root.
+        |_ chain_to_physical_source  - Path from a virtual node down to its physical root.
         |_ walk_chain       - Traverses container handlers to extract the target's bytes.
 
 Expansion API (Concurrency-Safe Discovery):
@@ -16,9 +16,9 @@ Expansion API (Concurrency-Safe Discovery):
     resolve_data_from_address - Resolves a target Address directly to raw bytes, triggering expansions as needed.
     unpack_recursive        - Deeply expands a target and all of its children recursively.
 
-Package API
-    package_members         - Ask the assembler which nodes a package's handler needs.
-    ensure_package          - None-blocking: expand until every member is reachable.
+Package API:
+    package_members         - Ask the source profile which nodes a package's handler needs.
+    ensure_package          - Non-blocking: expand until every member is reachable.
     resolve_package         - Blocking: collect members + bytes into a ResolvedPackage.
     open_handler            - Construct the handler for a package.
 
@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(f'radiata.{__name__}')
 
+Intent = BaseSource.Packages.Intent
+Member = BaseSource.Packages.Member
+
 ###----------------------------------- Exceptions ----------------------------------------###
 
 class ExpansionTimeoutError(RuntimeError):
@@ -54,7 +57,6 @@ class ExpansionTimeoutError(RuntimeError):
     Letting the rebuild continue with stale/empty data would produce a
     silently corrupt output, so we raise instead.
     """
-    pass
 
 ###----------------------------------- Navigator ----------------------------------------###
 
@@ -70,13 +72,13 @@ class VfsNavigator:
             ghost_node_callback: Callable[[Address], None] | None = None,
             source_profile:      BaseSource | None = None,
             links:               BaseSource.Packages.LinkLookup | None = None,
-        ):
+    ) -> None:
         self.vfs  = vfs
         self.read = data_reader
         self.expansion_callback  = expansion_callback
         self.ghost_node_callback = ghost_node_callback
         self._source_profile     = source_profile
-        self._links     = links
+        self._links = links
         self._rollup_touched: set[VfsNode] = set()
 
         self._expand_waiters: dict[Address, list[Callable[[bool, VfsNode], None]]] = {}
@@ -122,13 +124,32 @@ class VfsNavigator:
         if already_resolved:
             if on_done:
                 on_done(True, node)
-            return  event
+            return event
         if not is_owner:
             logger.debug(f'Expansion already in-flight for {node}; queued waiter.')
             return event
         logger.debug(f'Claimed expansion for {node}')
-        self.expansion_callback(node, event)
+        self._launch_expansion(node, event)
         return event
+
+    def _launch_expansion(self, node: VfsNode, event: threading.Event) -> None:
+        '''
+        Start the claimed expansion once the node's package members are resolved.
+        Every expansion funnels through here (UI, ghost drill-down, deep unpack)
+
+        '''
+        def _go() -> None:
+            self.expansion_callback(node, event)
+        def _abort(reason: str) -> None:
+            logger.error(f'{node}: expansion aborted, {reason}')
+            self.complete_expansion(node, False)
+        try:
+            if not self.package_members(node):
+                _go()
+                return
+            self.ensure_package(node, Intent.ACCESS, _go, _abort)
+        except PackageError as e:
+            _abort(str(e))
 
     def complete_expansion(self, node: VfsNode, success: bool) -> None:
         '''
@@ -151,13 +172,23 @@ class VfsNavigator:
         if self.ghost_node_callback:
             self.ghost_node_callback(address)
 
-    def _evaluate_stalled(self, ancestor: VfsNode, target_address: Address) -> bool:
+    def _evaluate_stalled(self, ancestor: VfsNode, target_address: Address, has_missing: bool = True) -> bool:
+        '''
+        True if expansion can't progress further.
+
+        has_missing=False is for addresses taht may legitimately not  exist (empty package member),
+        a confirmed miss is then not reported, so that their metadata entry is not purged.
+        '''
         if ancestor.last_expansion_success is None:
             return False
-        logger.error(f'Expansion stalled at {ancestor.address}. Failed to reach target: {target_address}')
-        if ancestor.last_expansion_success is True:
+        log = logger.error if has_missing else logger.debug
+        log(
+            f'Expansion stalled at {ancestor.address}. Failed to reach target: {target_address}'
+        )
+        if ancestor.last_expansion_success is True and has_missing:
             self._report_confirmed_missing(
-                target_address, f'Ancestor {ancestor.address} expanded successfully, but target never appeared.'
+                target_address,
+                f'Ancestor {ancestor.address} expanded successfully, but target never appeared.'
             )
         else:
             logger.warning(
@@ -178,7 +209,7 @@ class VfsNavigator:
             return b''
         return self._walk_chain(chain)
 
-    def resolve_data_from_address(self, target: Address | None) -> bytes | None:
+    def resolve_data_from_address(self, target: Address | None, has_missing: bool = True) -> bytes | None:
         '''
         Resolve an Address to raw bytes. snapshot -> expand missing -> re-read. In order of hids indexes.
         Returning pending data first if exists.
@@ -197,7 +228,7 @@ class VfsNavigator:
             ancestor = self.vfs.find_nearest_ancestor(target)
             if not ancestor:
                 break
-            if self._evaluate_stalled(ancestor, target):
+            if self._evaluate_stalled(ancestor, target, has_missing):
                 break
             if not self._needs_expansion(ancestor):
                 break
@@ -231,55 +262,100 @@ class VfsNavigator:
 
     ###---------------------------------- Packages ----------------------------------###
 
-    def package_members(self, node: VfsNode, intent: BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS) -> tuple[BaseSource.Packages.Member, ...]:
+    def package_members(self, node: VfsNode, intent: Intent = Intent.ACCESS) -> tuple[Member, ...]:
         '''What the active source says node's handler needs.'''
         if self._source_profile is None or self._links is None:
             return ()
         return self._source_profile.packages.members(node, intent, self._links)
 
-    def _require_namespaces(self, node: VfsNode, members: tuple[BaseSource.Packages.Member, ...]) -> None:
+    def _require_namespaces(self, node: VfsNode, members: tuple[Member, ...]) -> None:
         '''Raise PackageError before any work if a required member lives in an inaccessible namespace.'''
         accessible = self.vfs.accessible
         missing = sorted({m.address[0] for m in members if m.required and m.address[0] not in accessible})
         if missing:
             raise PackageError(f'{node}: package needs namespace(s) {missing}, which are not accessible (accessible:{sorted(accessible)}')
 
-    def ensure_package(self, node: VfsNode, intent: BaseSource.Packages.Intent, on_ready: Callable[[], None]) -> None:
-        '''Ensure the package for the given node is ready, calling on_ready when done.'''
+    def ensure_package(
+        self,
+        node:     VfsNode,
+        intent:   Intent,
+        on_ready: Callable[[], None],
+        on_error: Callable[[str], None] | None = None
+    ) -> None:
+        '''Ensure the package for the given node is ready, calling on_ready when done.
+        If a membver can never be reached, on_error(reason) is called instead of on_ready'''
         members = self.package_members(node, intent)
         self._require_namespaces(node, members)
-        pending = [m.address for m in members if m.required]
+        pending = list(members)
+
+        def _fail(reason: str) -> None:
+            message = f'{node}: package not ready for {intent.name}: {reason}'
+            logger.error(message)
+            if on_error:
+                on_error(message)
+
+        def _skip(reason: str) -> None:
+            skipped = pending.pop(0)
+            logger.debug(f'{node}: optional package member "{skipped.role}" at {skipped.address} - skipped ({reason})')
+            _next()
+
         def _next(_: VfsNode | None = None) -> None:
-            while pending and self.vfs.get_node(pending[0]) is not None:
+            while pending and self.vfs.get_node(pending[0].address) is not None:
                 pending.pop(0)
             if not pending:
                 on_ready()
                 return
-            self.resolve_ghost_node(pending[0], _next)
+            member = pending[0]
+            if member.required:
+                self._drill_down_to(member.address, _next, _fail)
+            else:
+                self._drill_down_to(member.address, _next, _skip, has_missing=False)
+
         _next()
 
-    def resolve_package(self, node: VfsNode, intent: BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS) -> ResolvedPackage | None:
+    def _describe_unreachable(self, member: Member) -> str:
+        '''Explain why a member address could not be resolved. (for PackageError messages)'''
+        ancestor = self.vfs.find_nearest_ancestor(member.address)
+        if ancestor is None:
+            reason = 'no registered ancestor in the VFS'
+        elif ancestor.last_expansion_success is True:
+            reason = f'nearest ancestor {ancestor.address} expanded but does not contain it'
+        elif ancestor.last_expansion_success is False:
+            reason = f'nearest ancestor {ancestor.address} failed to expand'
+        elif not self._needs_expansion(ancestor):
+            reason = f'nearest ancestor {ancestor.address} cannot be expanded'
+        else:
+            reason = f'nearest ancestor {ancestor.address} was never expanded'
+        return f'{member.role} at {member.address} ({reason})'
+
+    def resolve_package(self, node: VfsNode, intent:  Intent = Intent.ACCESS) -> ResolvedPackage | None:
         '''Collect all the package's required members and their bytes, blocking until ready'''
         specs = self.package_members(node, intent)
         if not specs:
             return None
         self._require_namespaces(node, specs)
-        members: dict[str, VfsNode] = {}
-        data:    dict[str, bytes] = {}
+        members:  dict[str, VfsNode] = {}
+        data:     dict[str, bytes] = {}
+        failures: list[str] = []
         for spec in specs:
+            member = self.vfs.get_node(spec.address)
             if spec.required:
-                member = self.vfs.get_node(spec.address)
                 raw    = self.resolve_data_from_address(spec.address)
             else:  # check the bytes so the VFS is not consulted (save nonexistant metadata addresses)
-                member = self.vfs.get_node(spec.address)
-                raw    = self.read(member) if member is not None else None
+                raw    = self.resolve_data_from_address(spec.address, has_missing=False)
             if raw is None or member is None:
                 if spec.required:
-                    raise PackageError(f'{node}: required package member {spec.role} at {spec.address}')
-                logger.debug(f'{node}: optional package member "{spec.role}" at {spec.address} not materialized - skipped')
+                    failures.append(self._describe_unreachable(spec))
+                else:
+                    logger.debug(f'{node}: optional package member "{spec.role}" at {spec.address} not materialized - skipped')
                 continue
             members[spec.role] = member
             data[spec.role]    = raw
+        if failures:
+            raise PackageError(
+                f'{node}: {len(failures)} required package member(s) '
+                f'unreachable for {intent.name}:\n  ' + '\n  '.join(failures)
+            )
         return ResolvedPackage(node, members, data)
 
     @contextmanager
@@ -289,7 +365,7 @@ class VfsNavigator:
         node:          VfsNode,
         task_handle:   TaskHandle,
         raw_bytes:     bytes,
-        intent:        BaseSource.Packages.Intent = BaseSource.Packages.Intent.ACCESS,
+        intent:        Intent = Intent.ACCESS,
     ) -> Iterator[BaseHandler]:
         '''Construct a handler injecting task_handle and package data.'''
         if not issubclass(handler_class, (ContainerHandler, LeafHandler)):
@@ -369,7 +445,7 @@ class VfsNavigator:
                     task_handle.log_message.emit(f'Sending {node} to cached roll-up')
                     nonseq_nodes.add(node)
                     break
-                current_node = current_node.parent if current_node.is_physical is False else None
+                current_node = current_node.parent if not current_node.is_physical else None
 
         if not nonseq_nodes:
             task_handle.log_message.emit('No nonsequential files. Nothing to precompute.')
@@ -384,7 +460,7 @@ class VfsNavigator:
             node.clear_pending()
         self._rollup_touched.clear()
 
-    ###---------------------- helpers -------------------------###
+    ###---------------------- Helpers -------------------------###
 
     def _expand_pending(self, unresolved: list[Address]) -> None:
         '''
@@ -411,13 +487,21 @@ class VfsNavigator:
     def _drill_down_to(
         self,
         target_address: Address,
-        on_success: Callable[[VfsNode], None],
+        on_success:     Callable[[VfsNode], None],
+        on_fail:        Callable[[str], None] | None = None,
+        has_missing:    bool = True,
     ) -> None:
         '''
         Recursively expand ancestors until target_address becomes reachable.
         Bounded by tree depth and _evaluate_stalled which will trigger metadata cleaning
-        on confirmed false entries.
+        on confirmed false entries. If given on_fail(reason) is called when the target
+        can never be reached, otherwise the failure is only logged.
         '''
+        def _fail(reason: str) -> None:
+            (logger.error if has_missing else logger.debug)(reason)
+            if on_fail:
+                on_fail(reason)
+
         node = self.vfs.get_node(target_address)
         if node:
             on_success(node)
@@ -425,21 +509,23 @@ class VfsNavigator:
 
         ancestor = self.vfs.find_nearest_ancestor(target_address)
         if not ancestor:
-            logger.error(f'Cannot resolve {target_address}: No ancestor exists.')
+            _fail(f'Cannot resolve {target_address}: No ancestor exists.')
             return
 
-        if self._evaluate_stalled(ancestor, target_address):
+        if self._evaluate_stalled(ancestor, target_address, has_missing):
+            _fail(f'Cannot resolve {target_address}: expansion stalled at {ancestor.address}.')
             return
+
         if not self._needs_expansion(ancestor):
-            logger.error(f'Cannot resolve {target_address} from ancestor {ancestor.address}')
+            _fail(f'Cannot resolve {target_address} from ancestor {ancestor.address}')
             return
 
         logger.debug(f'Drilling down to {target_address} from ancestor {ancestor.address}')
         def _continue(success: bool, expanded_node: VfsNode) -> None:
             if not success:
-                logger.error(f'Failed to drill down to {target_address}. Failed at {expanded_node.name} {expanded_node.address}.')
+                _fail(f'Failed to drill down to {target_address}. Failed at {expanded_node.name} {expanded_node.address}.')
                 return
-            self._drill_down_to(target_address, on_success)
+            self._drill_down_to(target_address, on_success, on_fail, has_missing)
 
         self.request_expansion(ancestor, _continue)
 
@@ -450,13 +536,13 @@ class VfsNavigator:
         on_success: Callable[[list[VfsNode]], None],
     ) -> None:
         '''
-        Consumes `queue` synchronously as long as each node resolves
+        Consume `queue` synchronously as long as each node resolves
         immediately via request_expansion's fast path. If an expansion goes
         async, stops. The queued callback re-enters this method once
         complete_expansion() fires for that node, from whichever thread that
         happens on.
         '''
-        if not isinstance(queue, deque):  # cast list to deque for O(1) pop perf
+        if not isinstance(queue, deque):  # O(1) pops
             queue = deque(queue)
         while queue:
             node = queue.popleft()
@@ -487,9 +573,7 @@ class VfsNavigator:
     def _walk_chain(self, chain: list[VfsNode]) -> bytes:
         '''helper to walk the path from the physical source to virtual requested file'''
         current_bytes = self.read(chain[0])
-        for i in range(1, len(chain)):
-            container     = chain[i -1]
-            target        = chain[i]
+        for container, target in zip(chain, chain[1:]):
             handler_class = Registry.get_handler(container)
             logger.debug(f'Currently at {container.address} searching until {target.address}')
             if not handler_class:
